@@ -341,7 +341,7 @@ class Qwen3OpenVINOConfig(TextDecoderWithPositionIdsOnnxConfig):
         self, model: Union["PreTrainedModel", "TFPreTrainedModel"], model_kwargs: Optional[Dict[str, Any]] = None
     ) -> "ModelPatcher":
         return OVDecoderModelPatcher(self, model, model_kwargs=model_kwargs)
-
+# Ethan
 class DummyQwen3VLLMInputGenerator(DummyTextInputGenerator):
     SUPPORTED_INPUT_NAMES = (
         "input_ids",
@@ -351,6 +351,7 @@ class DummyQwen3VLLMInputGenerator(DummyTextInputGenerator):
         "position_ids",
         "visual_pos_masks",
         "deepstack_visual_embeds",
+        "visual_indices",
     )
     
     def __init__(
@@ -382,7 +383,7 @@ class DummyQwen3VLLMInputGenerator(DummyTextInputGenerator):
 
     def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32", bool_dtype: str = "bool"):
         if input_name == "deepstack_visual_embeds":
-            return self.random_float_tensor([3, 2*self.sequence_length, self.embed_dim], framework=framework, dtype=float_dtype)
+            return self.random_float_tensor([3, self.sequence_length - 2, self.embed_dim], framework=framework, dtype=float_dtype)
         if input_name == "visual_pos_masks":
             return self.constant_tensor(
                 shape=[self.batch_size, self.sequence_length],
@@ -390,6 +391,23 @@ class DummyQwen3VLLMInputGenerator(DummyTextInputGenerator):
                 value=1,
                 dtype=DTYPE_MAPPER.pt(bool_dtype),
             )
+        if input_name == "visual_indices":
+            shape=[self.sequence_length, 2],
+            import torch
+            # For generating a tensor with shape [sequence_length, 2] where the first column is all zeros
+            # and the second column ranges from 15 to 644 (or sequence_length + 14)
+            # Create indices from 0 to sequence_length-1, then add 15 to get range 15 to sequence_length+14
+            indices = torch.arange(self.sequence_length - 2) + 2
+            # Stack zeros and indices to create the desired shape
+            tensor_data = torch.stack([torch.zeros(self.sequence_length - 2, dtype=DTYPE_MAPPER.pt(int_dtype)), indices], dim=1)
+            print(tensor_data.shape)
+            return tensor_data
+            # return self.constant_tensor(
+            #     shape=[self.sequence_length, 2],
+            #     framework=framework,
+            #     value=1,
+            #     dtype=DTYPE_MAPPER.pt(int_dtype),
+            # )
         return super().generate(input_name, framework, int_dtype, float_dtype)
     
 @register_in_tasks_manager(
@@ -414,11 +432,11 @@ class Qwen3VLTextOpenVINOConfig(TextDecoderWithPositionIdsOnnxConfig):
     DUMMY_INPUT_GENERATOR_CLASSES = (DummyQwen3VLLMInputGenerator, GemmaDummyPastKeyValuesGenerator)
     DUMMY_PKV_GENERATOR_CLASS = GemmaDummyPastKeyValuesGenerator
     NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
-
+    # Ethan
     @property
     def inputs(self) -> Dict[str, Dict[int, str]]:
         common_inputs = super().inputs
-        common_inputs["visual_pos_masks"] = {0: "batch_size", 1: "sequence_length"}
+        common_inputs["visual_indices"] = {0: "sequence_length", 1: "sequence_length"}
         common_inputs["deepstack_visual_embeds"] = {0: "num_layers", 1: "visual_seqlen"}
         return common_inputs
 

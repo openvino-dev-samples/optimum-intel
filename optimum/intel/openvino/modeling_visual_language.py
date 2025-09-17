@@ -144,6 +144,7 @@ class OVModelWithEmbedForCausalLM(OVModelForCausalLM):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         token_type_ids: Optional[torch.LongTensor] = None,
+        visual_indices: Optional[torch.LongTensor] = None,
         visual_pos_masks: Optional[torch.FloatTensor] = None,
         deepstack_visual_embeds: Optional[torch.FloatTensor] = None,
         
@@ -198,15 +199,23 @@ class OVModelWithEmbedForCausalLM(OVModelForCausalLM):
             if visual_pos_masks is not None:
                 inputs["visual_pos_masks"] = visual_pos_masks
             else:
-                inputs["visual_pos_masks"] = torch.zeros(1, 1, dtype=torch.bool)
-
+                inputs["visual_pos_masks"] = torch.zeros(1, 1, dtype=torch.int64)
+        
+        if "visual_indices" in self.input_names:
+            if visual_indices is not None:
+                inputs["visual_indices"] = visual_indices
+            else:
+                inputs["visual_indices"] = torch.zeros(1, 1, dtype=torch.int64)
+        print(inputs["visual_indices"].shape)
         if "deepstack_visual_embeds" in self.input_names:
             num_layers = len(self.config.vision_config.deepstack_visual_indexes)
             emd_dim = self.config.text_config.hidden_size
-            if isinstance(deepstack_visual_embeds, list):
+            if deepstack_visual_embeds is not None:
                 inputs["deepstack_visual_embeds"] = torch.Tensor(deepstack_visual_embeds)
             else:
                 inputs["deepstack_visual_embeds"] = torch.zeros((num_layers, 1, emd_dim), dtype=torch.float32)
+        print(inputs["deepstack_visual_embeds"].shape)
+        
         if "token_type_ids" in self.input_names:
             if token_type_ids is None:
                 token_type_ids = np.zeros(inputs_embeds.shape[:2], dtype=int)
@@ -787,7 +796,7 @@ class OVModelForVisualCausalLM(OVBaseModel, GenerationMixin):
         if pixel_values is None:
             pixel_values = images if images is not None else image_pixel_values
         if self.config.model_type == "qwen3_vl" or self.config.model_type == "qwen3_vl_moe":
-            inputs_embeds, attention_mask, position_ids, visual_pos_masks, deepstack_visual_embeds = self.get_multimodal_embeddings(
+            inputs_embeds, attention_mask, position_ids, visual_indices, deepstack_visual_embeds = self.get_multimodal_embeddings(
                 input_ids,
                 pixel_values,
                 inputs_embeds=inputs_embeds,
@@ -818,7 +827,7 @@ class OVModelForVisualCausalLM(OVBaseModel, GenerationMixin):
                 position_ids=position_ids,
                 token_type_ids=token_type_ids,
                 past_key_values=past_key_values,
-                visual_pos_masks=visual_pos_masks,
+                visual_indices=visual_indices,
                 deepstack_visual_embeds=deepstack_visual_embeds,
                 **kwargs,
             )
@@ -3935,8 +3944,9 @@ class _OVQwen3VLForCausalLM(OVModelForVisualCausalLM):
                     delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
-        return inputs_embeds, attention_mask, position_ids, visual_pos_masks, deepstack_visual_embeds 
-    
+        visual_indices = visual_pos_masks.nonzero()
+        return inputs_embeds, attention_mask, position_ids, visual_indices, deepstack_visual_embeds
+
     @staticmethod
     def preprocess_inputs(
         text: str,

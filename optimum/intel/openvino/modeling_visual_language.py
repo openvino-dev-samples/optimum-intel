@@ -818,8 +818,6 @@ class OVModelForVisualCausalLM(OVBaseModel, GenerationMixin):
                 position_ids=position_ids,
                 token_type_ids=token_type_ids,
                 past_key_values=past_key_values,
-                visual_pos_masks=visual_pos_masks,
-                deepstack_visual_embeds=deepstack_visual_embeds,
                 **kwargs,
             )
         else:

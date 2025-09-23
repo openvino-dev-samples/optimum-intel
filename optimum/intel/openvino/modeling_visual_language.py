@@ -818,7 +818,6 @@ class OVModelForVisualCausalLM(OVBaseModel, GenerationMixin):
             input_mode=input_mode,
             **kwargs,
         )
-        print("==================================start llm inference==================================")
         return self.language_model.forward(
             input_ids=None,
             inputs_embeds=inputs_embeds,

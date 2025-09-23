@@ -299,7 +299,7 @@ class OVBaseModel(OptimizedModel):
             cache_dir = Path(model_save_dir).joinpath("model_cache")
             ov_config["CACHE_DIR"] = str(cache_dir)
             logger.info(f"Setting OpenVINO CACHE_DIR to {str(cache_dir)}")
-
+        print(f"====Compiling the model to {device.upper()} ...===")
         compiled_model = core.compile_model(model, device.upper() if device is not None else device, config=ov_config)
         if "OPENVINO_LOG_LEVEL" in os.environ and int(os.environ["OPENVINO_LOG_LEVEL"]) > 2:
             _print_compiled_model_properties(compiled_model)
@@ -707,7 +707,8 @@ class OVBaseModel(OptimizedModel):
     def compile(self):
         if self.request is None:
             ov_config = {**self.ov_config}
-            logger.info(f"Compiling the model to {self._device} ...")
+            print(f"Compiling the model to {self._device} ...")
+            print(f"Model config on {self._device} is {ov_config}")
             self.request = self._compile_model(self.model, self._device, ov_config, self.model_save_dir)
 
     def _reshape(
@@ -837,8 +838,12 @@ class OVModelPart:
             ):
                 self.ov_config["CACHE_DIR"] = os.path.join(self._model_dir, self._model_name, "model_cache")
 
-            logger.info(f"Compiling the {self._model_name} to {self._device} ...")
-            self.request = core.compile_model(self.model, self._device, self.ov_config)
+            if self._model_name == "vision_embeddings":
+                print(f"Compiling the {self._model_name} to CPU ...")
+                self.request = core.compile_model(self.model, "CPU", self.ov_config)
+            else:
+                print(f"Compiling the {self._model_name} to {self._device} ...")
+                self.request = core.compile_model(self.model, self._device, self.ov_config)
             # OPENVINO_LOG_LEVEL can be found in https://docs.openvino.ai/2023.2/openvino_docs_OV_UG_supported_plugins_AUTO_debugging.html
             if "OPENVINO_LOG_LEVEL" in os.environ and int(os.environ["OPENVINO_LOG_LEVEL"]) > 2:
                 _print_compiled_model_properties(self.request)

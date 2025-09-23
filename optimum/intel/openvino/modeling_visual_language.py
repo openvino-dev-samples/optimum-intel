@@ -109,6 +109,14 @@ class OVModelWithEmbedForCausalLM(OVModelForCausalLM):
     def compile(self):
         if self.request is None:
             logger.info(f"Compiling the Language model to {self._device} ...")
+            if self._device=="NPU":
+                print(f"Compiling the Language model to {self._device} ...")
+                self.ov_config={
+                    "NPU_USE_NPUW" : "YES",
+                    "NPUW_LLM" : "YES",
+                    "NPUW_ONLINE_PIPELINE" : "NONE",
+                    "MAX_PROMPT_LEN" : 1024,
+                }
             super().compile()
         self._compile_text_emb()
 
@@ -118,9 +126,9 @@ class OVModelWithEmbedForCausalLM(OVModelForCausalLM):
             if self._compile_only:
                 self.text_emb_request = self.text_emb_model
             else:
-                logger.info(f"Compiling the Text embeddings model to {self._device} ...")
+                print(f"Compiling the Text embeddings model to CPU ...")
                 self.text_emb_request = self._compile_model(
-                    self.text_emb_model, self._device, self.ov_config, self.model_save_dir
+                    self.text_emb_model, "CPU", {}, self.model_save_dir
                 )
 
     def clear_requests(self):
@@ -786,73 +794,40 @@ class OVModelForVisualCausalLM(OVBaseModel, GenerationMixin):
     ):
         if pixel_values is None:
             pixel_values = images if images is not None else image_pixel_values
-        if self.config.model_type == "qwen3_vl" or self.config.model_type == "qwen3_vl_moe":
-            inputs_embeds, attention_mask, position_ids, visual_pos_masks, deepstack_visual_embeds = self.get_multimodal_embeddings(
-                input_ids,
-                pixel_values,
-                inputs_embeds=inputs_embeds,
-                image_sizes=image_sizes,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                image_bound=image_bound,
-                tgt_sizes=tgt_sizes,
-                pixel_values_videos=pixel_values_videos,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                rope_deltas=rope_deltas,
-                second_per_grid_ts=second_per_grid_ts,
-                pixel_attention_mask=pixel_attention_mask,
-                input_image_embeds=input_image_embeds,
-                image_attention_mask=image_attention_mask,
-                input_audio_embeds=input_audio_embeds if input_audio_embeds is not None else audio_input_features,
-                audio_embed_sizes=audio_embed_sizes,
-                audio_attention_mask=audio_attention_mask,
-                input_mode=input_mode,
-                **kwargs,
-            )
-            return self.language_model.forward(
-                input_ids=None,
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                token_type_ids=token_type_ids,
-                past_key_values=past_key_values,
-                **kwargs,
-            )
-        else:
-            inputs_embeds, attention_mask, position_ids = self.get_multimodal_embeddings(
-                input_ids,
-                pixel_values,
-                image_sizes=image_sizes,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                image_bound=image_bound,
-                tgt_sizes=tgt_sizes,
-                pixel_values_videos=pixel_values_videos,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                rope_deltas=rope_deltas,
-                second_per_grid_ts=second_per_grid_ts,
-                pixel_attention_mask=pixel_attention_mask,
-                input_image_embeds=input_image_embeds,
-                image_attention_mask=image_attention_mask,
-                input_audio_embeds=input_audio_embeds if input_audio_embeds is not None else audio_input_features,
-                audio_embed_sizes=audio_embed_sizes,
-                audio_attention_mask=audio_attention_mask,
-                input_mode=input_mode,
-                **kwargs,
-            )
-            return self.language_model.forward(
-                input_ids=None,
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                token_type_ids=token_type_ids,
-                past_key_values=past_key_values,
-                **kwargs,
-            )
+
+        inputs_embeds, attention_mask, position_ids = self.get_multimodal_embeddings(
+            input_ids,
+            pixel_values,
+            image_sizes=image_sizes,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            image_bound=image_bound,
+            tgt_sizes=tgt_sizes,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            rope_deltas=rope_deltas,
+            second_per_grid_ts=second_per_grid_ts,
+            pixel_attention_mask=pixel_attention_mask,
+            input_image_embeds=input_image_embeds,
+            image_attention_mask=image_attention_mask,
+            input_audio_embeds=input_audio_embeds if input_audio_embeds is not None else audio_input_features,
+            audio_embed_sizes=audio_embed_sizes,
+            audio_attention_mask=audio_attention_mask,
+            input_mode=input_mode,
+            **kwargs,
+        )
+        print("==================================start llm inference==================================")
+        return self.language_model.forward(
+            input_ids=None,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            token_type_ids=token_type_ids,
+            past_key_values=past_key_values,
+            **kwargs,
+        )
 
     def _reorder_cache(self, past_key_values, beam_idx):
         return self.language_model._reorder_cache(past_key_values, beam_idx)
@@ -3726,6 +3701,8 @@ class _OVQwen3VLForCausalLM(OVModelForVisualCausalLM):
 
         idx_tensor = torch.tensor(idx_list)
         weight_tensor = torch.tensor(weight_list)
+        print("=============================vision_embeddings_pos inputs=============================")
+        print("idx_tensor.shape:", idx_tensor.shape)
         pos_embeds = torch.from_numpy(self.vision_embeddings_pos(idx_tensor)) * weight_tensor[:, :, None]
         patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
 
@@ -3787,6 +3764,8 @@ class _OVQwen3VLForCausalLM(OVModelForVisualCausalLM):
     
     
     def get_vision_embeddings(self, pixel_values, grid_thw, **kwargs):
+        # Pad the 2nd dimension (channel dimension) of pixel_values with zeros to size 2048
+        # 如果第二个维度小于2048则右侧补0；如果大于2048则截断到2048
         hidden_states = torch.from_numpy(self.vision_embeddings(pixel_values)[0])
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
         hidden_states = hidden_states + pos_embeds
@@ -3795,6 +3774,10 @@ class _OVQwen3VLForCausalLM(OVModelForVisualCausalLM):
         seq_len, _ = hidden_states.size()
         hidden_states = hidden_states.reshape(seq_len, -1)
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+        print(hidden_states.shape)
+        
+        # Pad first dimension (sequence length) of hidden_states and rotary_pos_emb to 4096 with zeros
+
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
             dim=0, dtype=torch.int32
         )
@@ -3805,10 +3788,10 @@ class _OVQwen3VLForCausalLM(OVModelForVisualCausalLM):
             attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = True
 
         causal_mask.masked_fill_(torch.logical_not(attention_mask), float("-inf"))
-
         res = self.vision_embeddings_merger(
             pixel_values=hidden_states, attention_mask=causal_mask, rotary_pos_emb=rotary_pos_emb
         )
+        print(res[0].shape)
         return res[0], res[1]
     
     
@@ -3823,10 +3806,12 @@ class _OVQwen3VLForCausalLM(OVModelForVisualCausalLM):
                 The temporal, height and width of feature shape of each image in LLM.
         """
         # pixel_values = pixel_values.type(self.visual.dtype)
+        
         image_embeds, deepstack_image_embeds = self.get_vision_embeddings(pixel_values, image_grid_thw)
         image_embeds, deepstack_image_embeds = torch.from_numpy(image_embeds), torch.from_numpy(deepstack_image_embeds)
         deepstack_image_embeds = deepstack_image_embeds.tolist()
         split_sizes = (image_grid_thw.prod(-1) // self.spatial_merge_size**2).tolist()
+        print(image_embeds.shape, split_sizes)
         image_embeds = torch.split(image_embeds, split_sizes)
         return image_embeds, deepstack_image_embeds
     
@@ -3864,9 +3849,15 @@ class _OVQwen3VLForCausalLM(OVModelForVisualCausalLM):
     ):
         image_mask = None
         video_mask = None
+        # Pad input_ids to shape (1, 1024) with zeros
+        # if input_ids.size(1) < 1024:
+        #     pad_len = 1024 - input_ids.size(1)
+        #     pad = torch.zeros(input_ids.size(0), pad_len, dtype=input_ids.dtype, device=input_ids.device)
+        #     input_ids = torch.cat([input_ids, pad], dim=1)
         inputs_embeds = torch.from_numpy(self.get_text_embeddings(input_ids))
-
+        
         if pixel_values is not None:
+            
             image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
             image_embeds = torch.cat(image_embeds, dim=0)
             image_mask, _ = self.get_placeholder_mask(
@@ -3907,18 +3898,28 @@ class _OVQwen3VLForCausalLM(OVModelForVisualCausalLM):
             deepstack_visual_embeds = deepstack_video_embeds
 
         if position_ids is None:
+            attention_mask_tensor = (
+                attention_mask if not isinstance(attention_mask, dict) else attention_mask["full_attention"]
+            )
+            if attention_mask_tensor is not None and attention_mask_tensor.ndim == 4:
+                attention_mask_tensor = torch.diagonal(attention_mask_tensor[:, 0], dim1=1, dim2=2)
+                # Only apply conversion for floating point tensors (inverted masks)
+                if attention_mask_tensor.dtype.is_floating_point:
+                    attention_mask_tensor = attention_mask_tensor / torch.finfo(attention_mask_tensor.dtype).min
+                    attention_mask_tensor = (1.0 - attention_mask_tensor).int()
 
             # Calculate RoPE index once per generation in the pre-fill stage only.
             # When compiling, we can't check tensor values thus we check only input length
             # It is safe to assume that `length!=1` means we're in pre-fill because compiled
             # models currently cannot do asssisted decoding
-            if position_ids is None and input_ids is not None and (attention_mask is None or attention_mask.ndim == 2):
-                # calculate RoPE index once per generation in the pre-fill stage only
-                if (cache_position is not None and cache_position[0] == 0) or self.rope_deltas is None:
-                    position_ids, rope_deltas = self.get_rope_index(
-                        input_ids, image_grid_thw, video_grid_thw, attention_mask
-                    )
-                    self.rope_deltas = rope_deltas
+            if self.rope_deltas is None:
+                position_ids, rope_deltas = self.get_rope_index(
+                    input_ids,
+                    image_grid_thw,
+                    video_grid_thw,
+                    attention_mask=attention_mask_tensor,
+                )
+                self.rope_deltas = rope_deltas
             # then use the prev pre-calculated rope-deltas to get the correct position ids
             else:
                 batch_size, seq_length, _ = inputs_embeds.shape
@@ -3933,7 +3934,7 @@ class _OVQwen3VLForCausalLM(OVModelForVisualCausalLM):
                     delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
-        return inputs_embeds, attention_mask, position_ids, visual_pos_masks, deepstack_visual_embeds 
+        return inputs_embeds, attention_mask, position_ids
     
     @staticmethod
     def preprocess_inputs(

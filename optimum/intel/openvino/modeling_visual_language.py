@@ -3862,10 +3862,23 @@ class _OVQwen3VLForCausalLM(OVModelForVisualCausalLM):
         #     input_ids = torch.cat([input_ids, pad], dim=1)
         inputs_embeds = torch.from_numpy(self.get_text_embeddings(input_ids))
         
+
         if pixel_values is not None:
+            # Split pixel_values along the first dimension in chunks of 2560
+            batch_size = pixel_values.shape[0]
+            deepstack_image_embeds_list = []
+            image_embeds_list = []
+
+            for idx, start_idx in enumerate(range(0, batch_size, 2520)):
+                end_idx = min(start_idx + 2520, batch_size)
+                pixel_values_chunk = pixel_values[start_idx:end_idx]
+                image_grid_thw_chunk = image_grid_thw[idx, None]
+                chunk_image_embeds, chunk_deepstack_image_embeds = self.get_image_features(pixel_values_chunk, image_grid_thw_chunk)
+                
+                image_embeds_list.extend(chunk_image_embeds)
+                deepstack_image_embeds_list.extend(chunk_deepstack_image_embeds)
             
-            image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
-            image_embeds = torch.cat(image_embeds, dim=0)
+            image_embeds = torch.cat(image_embeds_list, dim=0)
             image_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
             )
@@ -3879,29 +3892,6 @@ class _OVQwen3VLForCausalLM(OVModelForVisualCausalLM):
             )
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
-        visual_pos_masks = None
-        deepstack_visual_embeds = None
-        if image_mask is not None and video_mask is not None:
-            # aggregate visual_pos_masks and deepstack_visual_embeds
-            image_mask = image_mask[..., 0]
-            video_mask = video_mask[..., 0]
-            visual_pos_masks = image_mask | video_mask
-            deepstack_visual_embeds = []
-            image_mask_joint = image_mask[visual_pos_masks]
-            video_mask_joint = video_mask[visual_pos_masks]
-            for img_embed, vid_embed in zip(deepstack_image_embeds, deepstack_video_embeds):
-                embed_joint = img_embed.new_zeros(visual_pos_masks.sum(), img_embed.shape[-1]).to(img_embed.device)
-                embed_joint[image_mask_joint, :] = img_embed
-                embed_joint[video_mask_joint, :] = vid_embed
-                deepstack_visual_embeds.append(embed_joint)
-        elif image_mask is not None:
-            image_mask = image_mask[..., 0]
-            visual_pos_masks = image_mask
-            deepstack_visual_embeds = deepstack_image_embeds
-        elif video_mask is not None:
-            video_mask = video_mask[..., 0]
-            visual_pos_masks = video_mask
-            deepstack_visual_embeds = deepstack_video_embeds
 
         if position_ids is None:
             attention_mask_tensor = (

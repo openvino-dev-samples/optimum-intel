@@ -839,8 +839,8 @@ class OVModelPart:
                 self.ov_config["CACHE_DIR"] = os.path.join(self._model_dir, self._model_name, "model_cache")
 
             if self._model_name == "vision_embeddings":
-                print(f"Compiling the {self._model_name} to CPU ...")
-                self.request = core.compile_model(self.model, "CPU", self.ov_config)
+                print(f"Compiling the {self._model_name} to GPU ...")
+                self.request = core.compile_model(self.model, "GPU", self.ov_config)
             else:
                 print(f"Compiling the {self._model_name} to {self._device} ...")
                 self.request = core.compile_model(self.model, self._device, self.ov_config)

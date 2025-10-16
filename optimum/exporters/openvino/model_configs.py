@@ -418,8 +418,8 @@ class Qwen3VLTextOpenVINOConfig(TextDecoderWithPositionIdsOnnxConfig):
     @property
     def inputs(self) -> Dict[str, Dict[int, str]]:
         common_inputs = super().inputs
-        common_inputs["visual_pos_masks"] = {0: "batch_size", 1: "sequence_length"}
-        common_inputs["deepstack_visual_embeds"] = {0: "num_layers", 1: "visual_seqlen"}
+        # common_inputs["visual_pos_masks"] = {0: "batch_size", 1: "sequence_length"}
+        # common_inputs["deepstack_visual_embeds"] = {0: "num_layers", 1: "visual_seqlen"}
         return common_inputs
 
     def patch_model_for_export(

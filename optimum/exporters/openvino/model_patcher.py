@@ -4348,7 +4348,7 @@ class Qwen3VLLanguageModelPatcher(OVDecoderModelPatcher):
 
         # Adopted from https://github.com/huggingface/transformers/blob/v4.51.3/src/transformers/models/phi4_multimodal/modeling_phi4_multimodal.py#L2156-L2178
         # moved audio and vision features processing outside model
-        def lm_forward(self, attention_mask, position_ids, past_key_values, inputs_embeds, visual_pos_masks, deepstack_visual_embeds, use_cache=True):
+        def lm_forward(self, attention_mask, position_ids, past_key_values, inputs_embeds, use_cache=True):
             from transformers.cache_utils import DynamicCache
 
             pkv = DynamicCache.from_legacy_cache(past_key_values)
@@ -4358,8 +4358,6 @@ class Qwen3VLLanguageModelPatcher(OVDecoderModelPatcher):
                 position_ids=position_ids,
                 use_cache=use_cache,
                 past_key_values=pkv,
-                visual_pos_masks=visual_pos_masks,
-                deepstack_visual_embeds=deepstack_visual_embeds,
             )
             hidden_states = outputs[0]
             # Only compute necessary logits, and do not upcast them to float if we are not computing the loss

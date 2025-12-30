@@ -127,9 +127,10 @@ else:
     CacheMixin = object
     
 if is_diffusers_version(">=", "0.35.0"):
-    from diffusers import ZImagePipeline
+    from diffusers import ZImagePipeline, ZImageOmniPipeline
 else:
     ZImagePipeline = object
+    ZImageOmniPipeline = object
 
 DIFFUSION_MODEL_TRANSFORMER_SUBFOLDER = "transformer"
 DIFFUSION_MODEL_TEXT_ENCODER_3_SUBFOLDER = "text_encoder_3"
@@ -1720,6 +1721,15 @@ class OVZImagePipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, ZImag
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+
+class OVZImageOmniPipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, ZImageOmniPipeline):
+    main_input_name = "prompt"
+    export_feature = "text-to-image"
+    auto_model_class = ZImageOmniPipeline
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+
 SUPPORTED_OV_PIPELINES = [
     OVStableDiffusionPipeline,
     OVStableDiffusionImg2ImgPipeline,
@@ -1807,7 +1817,9 @@ if is_diffusers_version(">=", "0.33.0"):
     
 if is_diffusers_version(">=", "0.35.0"):
     SUPPORTED_OV_PIPELINES.append(OVZImagePipeline)
+    SUPPORTED_OV_PIPELINES.append(OVZImageOmniPipeline)
     OV_TEXT2IMAGE_PIPELINES_MAPPING["z-image"] = OVZImagePipeline
+    OV_TEXT2IMAGE_PIPELINES_MAPPING["z-image-omni"] = OVZImageOmniPipeline
 
 SUPPORTED_OV_PIPELINES_MAPPINGS = [
     OV_TEXT2IMAGE_PIPELINES_MAPPING,

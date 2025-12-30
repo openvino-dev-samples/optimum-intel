@@ -3339,8 +3339,34 @@ def _zimage_forward(
     hidden_states,
     timestep,
     encoder_hidden_states,
+    condition_hidden_states=None,
+    siglip_embeds=None,
 ) -> torch.Tensor:
-    """Modified forward with renamed inputs and transformer_z_image behavior"""
+    """
+    Unified forward for ZImage transformer supporting both text-to-image and omni modes.
+    
+    Text-to-image mode (condition_hidden_states=None, siglip_embeds=None):
+        - hidden_states: [B, C, 1, H, W]
+        - timestep: [B]
+        - encoder_hidden_states: [B, seq_len, dim]
+        
+    Omni mode (with condition images):
+        - hidden_states: Target latent [B, C, 1, H, W]
+        - condition_hidden_states: Condition image latent [B, C, 1, H, W]
+        - timestep: [B]
+        - encoder_hidden_states: Text embeddings [B, seq_len, dim]
+        - siglip_embeds: Siglip features [B, num_patches, C_sig]
+    """
+    # Check if omni mode
+    omni_mode = condition_hidden_states is not None and siglip_embeds is not None
+    
+    if omni_mode:
+        return _zimage_forward_omni(
+            self, hidden_states, condition_hidden_states, timestep, 
+            encoder_hidden_states, siglip_embeds
+        )
+    
+    # Standard text-to-image mode
     # Convert inputs from batch tensors to lists
     x = list(torch.unbind(hidden_states, dim=0))
     t = timestep
@@ -3705,6 +3731,8 @@ class ZImageTransformerModelPatcher(ModelPatcher):
 
         self._orig_forward = self._model.forward
         self._orig_patchify_and_embed = self._model.patchify_and_embed
+        # Store orig_forward on model so patched forward can access it for omni mode
+        self._model._orig_forward = self._orig_forward
         self._model.forward = types.MethodType(_zimage_forward, self._model)
         self._model.patchify_and_embed = types.MethodType(
             _zimage_patchify_and_embed, self._model)
@@ -3728,6 +3756,68 @@ class ZImageTransformerModelPatcher(ModelPatcher):
         
         for layer in self._model.layers:
             layer.attention.processor = layer.attention._orig_processor
+
+
+def _zimage_forward_omni(
+    self,
+    hidden_states,
+    condition_hidden_states,
+    timestep,
+    encoder_hidden_states,
+    siglip_embeds,
+) -> torch.Tensor:
+    """
+    Forward for ZImageOmniPipeline with packed tensor inputs.
+    Converts packed tensor inputs to the list format expected by the original model.
+    
+    Args:
+        hidden_states: Target latent [B, C, 1, H, W]
+        condition_hidden_states: Condition image latent [B, C, 1, H, W] 
+        timestep: Timestep [B]
+        encoder_hidden_states: Text embeddings [B, seq_len, dim]
+        siglip_embeds: Siglip features [B, H_sig, W_sig, C_sig]
+        
+    Note: This assumes single condition image per batch item.
+    """
+    bsz = hidden_states.shape[0]
+    
+    # Build x_combined: List[List[Tensor]] - [condition image, target image] per batch
+    x_combined = []
+    for i in range(bsz):
+        cond_img = condition_hidden_states[i]  # [C, 1, H, W]
+        target_img = hidden_states[i]  # [C, 1, H, W]
+        x_combined.append([cond_img, target_img])
+    
+    # Build cap_feats: List[List[Tensor]] - duplicate text for condition and target
+    cap_feats = []
+    for i in range(bsz):
+        cap = encoder_hidden_states[i]  # [seq_len, dim]
+        cap_feats.append([cap, cap])  # same caption for cond and target
+    
+    # Build siglip_feats: List[List[Tensor | None]] - siglip for condition, None for target
+    siglip_feats = []
+    for i in range(bsz):
+        # siglip_embeds shape: [B, H_sig, W_sig, C_sig]
+        sig = siglip_embeds[i]  # [H_sig, W_sig, C_sig]
+        siglip_feats.append([sig, None])  # siglip for cond, None for target
+    
+    # Build image_noise_mask: List[List[int]]
+    image_noise_mask = [[0, 1] for _ in range(bsz)]  # 0=clean(cond), 1=noisy(target)
+    
+    # Call original model forward with omni mode inputs
+    # Note: We use the patched forward's underlying original forward
+    result = self._orig_forward(
+        x=x_combined,
+        t=timestep,
+        cap_feats=cap_feats,
+        siglip_feats=siglip_feats,
+        image_noise_mask=image_noise_mask,
+        return_dict=False,
+    )[0]
+    
+    # result is List[Tensor], stack back to batch
+    return torch.stack(result, dim=0)
+
 
 def _minicpmv_resampler_forward(self, image_feature, pos_embed, key_padding_mask):
     bs = image_feature.shape[0]

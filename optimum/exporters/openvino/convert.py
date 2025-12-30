@@ -979,7 +979,8 @@ def get_diffusion_models_for_export_ext(
     is_ltx_video = pipeline.__class__.__name__.startswith("LTX")
     is_sd = pipeline.__class__.__name__.startswith("StableDiffusion") and not is_sd3
     is_lcm = pipeline.__class__.__name__.startswith("LatentConsistencyModel")
-    is_zimage = pipeline.__class__.__name__.startswith("ZImage")
+    is_zimage_omni = pipeline.__class__.__name__ == "ZImageOmniPipeline"
+    is_zimage = pipeline.__class__.__name__.startswith("ZImage") and not is_zimage_omni
 
     if is_sd or is_sdxl or is_lcm:
         tokenizer = pipeline.tokenizer_2 if is_sdxl else pipeline.tokenizer
@@ -1003,6 +1004,8 @@ def get_diffusion_models_for_export_ext(
         models_for_export = get_sana_models_for_export(pipeline, exporter, int_dtype, float_dtype)
     elif is_ltx_video:
         models_for_export = get_ltx_video_models_for_export(pipeline, exporter, int_dtype, float_dtype)
+    elif is_zimage_omni:
+        models_for_export = get_zimage_omni_models_for_export(pipeline, exporter, int_dtype, float_dtype)
     elif is_zimage:
         models_for_export = get_zimage_models_for_export(pipeline, exporter, int_dtype, float_dtype)
     else:
@@ -1118,6 +1121,93 @@ def get_zimage_models_for_export(pipeline, exporter, int_dtype, float_dtype):
     models_for_export["transformer"] = (transformer, transformer_export_config)
 
     # VAE Decoder https://github.com/huggingface/diffusers/blob/v0.11.1/src/diffusers/models/vae.py#L600
+    vae_decoder = copy.deepcopy(pipeline.vae)
+    vae_decoder.forward = lambda latent_sample: vae_decoder.decode(z=latent_sample)
+    vae_config_constructor = TasksManager.get_exporter_config_constructor(
+        model=vae_decoder,
+        exporter=exporter,
+        library_name="diffusers",
+        task="semantic-segmentation",
+        model_type="dcae-decoder",
+    )
+    vae_decoder_export_config = vae_config_constructor(
+        vae_decoder.config, int_dtype=int_dtype, float_dtype=float_dtype
+    )
+    vae_decoder_export_config.runtime_options = {"ACTIVATIONS_SCALE_FACTOR": "8.0"}
+    models_for_export["vae_decoder"] = (vae_decoder, vae_decoder_export_config)
+
+    return models_for_export
+
+
+def get_zimage_omni_models_for_export(pipeline, exporter, int_dtype, float_dtype):
+    """Export models for ZImageOmniPipeline (includes siglip and vae_encoder)."""
+    models_for_export = {}
+
+    # Text encoder (Qwen3)
+    text_encoder = getattr(pipeline, "text_encoder", None)
+    if text_encoder is not None:
+        text_encoder.config.output_hidden_states = True
+        text_encoder_config_constructor = TasksManager.get_exporter_config_constructor(
+            model=text_encoder,
+            exporter=exporter,
+            library_name="diffusers",
+            task="feature-extraction",
+            model_type="qwen3",
+        )
+        text_encoder_export_config = text_encoder_config_constructor(
+            pipeline.text_encoder.config, int_dtype=int_dtype, float_dtype=float_dtype
+        )
+        models_for_export["text_encoder"] = (text_encoder, text_encoder_export_config)
+
+    # Siglip vision encoder
+    siglip = getattr(pipeline, "siglip", None)
+    if siglip is not None:
+        siglip_config_constructor = TasksManager.get_exporter_config_constructor(
+            model=siglip,
+            exporter=exporter,
+            library_name="diffusers",
+            task="feature-extraction",
+            model_type="siglip2-vision",
+        )
+        siglip_export_config = siglip_config_constructor(
+            siglip.config, int_dtype=int_dtype, float_dtype=float_dtype
+        )
+        models_for_export["siglip"] = (siglip, siglip_export_config)
+
+    # Transformer (use omni version for ZImageOmniPipeline)
+    transformer = pipeline.transformer
+    transformer.config.requires_aesthetics_score = getattr(pipeline.config, "requires_aesthetics_score", False)
+    transformer.config.time_cond_proj_dim = None
+    export_config_constructor = TasksManager.get_exporter_config_constructor(
+        model=transformer,
+        exporter=exporter,
+        library_name="diffusers",
+        task="semantic-segmentation",
+        model_type="z-image-omni-transformer-2d",
+    )
+    transformer_export_config = export_config_constructor(
+        pipeline.transformer.config, int_dtype=int_dtype, float_dtype=float_dtype
+    )
+    transformer_export_config.runtime_options = {"ACTIVATIONS_SCALE_FACTOR": "128.0"}
+    models_for_export["transformer"] = (transformer, transformer_export_config)
+
+    # VAE Encoder (for condition images)
+    vae_encoder = copy.deepcopy(pipeline.vae)
+    vae_encoder.forward = lambda sample: vae_encoder.encode(sample).latent_dist.mode()
+    vae_config_constructor = TasksManager.get_exporter_config_constructor(
+        model=vae_encoder,
+        exporter=exporter,
+        library_name="diffusers",
+        task="semantic-segmentation",
+        model_type="dcae-encoder",
+    )
+    vae_encoder_export_config = vae_config_constructor(
+        vae_encoder.config, int_dtype=int_dtype, float_dtype=float_dtype
+    )
+    vae_encoder_export_config.runtime_options = {"ACTIVATIONS_SCALE_FACTOR": "8.0"}
+    models_for_export["vae_encoder"] = (vae_encoder, vae_encoder_export_config)
+
+    # VAE Decoder
     vae_decoder = copy.deepcopy(pipeline.vae)
     vae_decoder.forward = lambda latent_sample: vae_decoder.decode(z=latent_sample)
     vae_config_constructor = TasksManager.get_exporter_config_constructor(

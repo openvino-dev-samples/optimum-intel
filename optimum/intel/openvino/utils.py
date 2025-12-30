@@ -148,7 +148,8 @@ _HEAD_TO_AUTOMODELS = {
     "automatic-speech-recognition-with-past": "OVModelForSpeechSeq2Seq",
     "ltx-video": "OVLTXPipeline",
     "text-to-audio": "OVModelForTextToSpeechSeq2Seq",
-    "z-image": "OVZImagePipeline"
+    "z-image": "OVZImagePipeline",
+    "z-image-omni": "OVZImageOmniPipeline"
 }
 
 PREDEFINED_CAUSAL_LANGUAGE_DATASETS = {"wikitext2", "c4", "c4-new", "auto"}

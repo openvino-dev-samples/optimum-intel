@@ -4589,6 +4589,7 @@ class DummyZImageOmniTransformerInputGenerator(DummyInputGenerator):
         "cap_feats",
         "t",
         "siglip_feats",
+        "image_noise_mask",
     )
 
     def __init__(
@@ -4617,15 +4618,15 @@ class DummyZImageOmniTransformerInputGenerator(DummyInputGenerator):
 
     def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
         if input_name == "x":
-            # For omni mode: List[List[Tensor]] with [[cond_img, target_img], ...]
-            # Condition image latent
+            # For omni mode: will be converted to List[List[Tensor]] in patcher
+            # Stack condition and target images: [2, B, C, 1, H, W]
             cond_shape = [self.batch_size, self.num_channels * 4, 1, self.height * 4, self.width * 4]
             cond_img = self.random_float_tensor(cond_shape, framework=framework, dtype=float_dtype)
-            # Target image latent
             target_shape = [self.batch_size, self.num_channels * 4, 1, self.height * 4, self.width * 4]
             target_img = self.random_float_tensor(target_shape, framework=framework, dtype=float_dtype)
-            # Return as list of lists
-            return [[cond_img, target_img]]
+            # Stack along first dimension for export
+            import torch
+            return torch.stack([cond_img, target_img], dim=0)
         if input_name == "cap_feats":
             # Text embeddings: [B, seq_len, dim]
             shape = [self.batch_size, self.sequence_length, self.cap_feat_dim]
@@ -4633,14 +4634,18 @@ class DummyZImageOmniTransformerInputGenerator(DummyInputGenerator):
         if input_name == "t":
             return self.random_float_tensor([self.batch_size], max_value=1, min_value=0, framework=framework, dtype=float_dtype)
         if input_name == "siglip_feats":
-            # For omni mode: List[List[Tensor]] with [[siglip, None], ...]
+            # For omni mode: will be converted to List[List[Tensor]] in patcher
             # Siglip features: [B, H_sig, W_sig, C_sig]
             siglip_h = self.height * 4 // 14  # approximate siglip spatial size
             siglip_w = self.width * 4 // 14
             shape = [self.batch_size, siglip_h, siglip_w, self.siglip_hidden_dim]
-            siglip_tensor = self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
-            # Return as list of lists with None for target image
-            return [[siglip_tensor, None]]
+            # Return single tensor for export
+            return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
+        if input_name == "image_noise_mask":
+            # Noise mask for omni mode: [[0, 1], ...] marking clean/noisy images
+            # 0 = clean (condition image), 1 = noisy (target image)
+            import torch
+            return torch.tensor([[0, 1]], dtype=torch.long)
 
         return super().generate(input_name, framework, int_dtype, float_dtype)
 
@@ -4667,6 +4672,8 @@ class ZOmniTransformerOpenVINOConfig(OnnxConfig):
         common_inputs["t"] = {0: "batch_size"}
         # siglip_feats: List[List[Tensor]] with [[siglip, None], ...]
         common_inputs["siglip_feats"] = {0: "batch_size", 1: "siglip_h", 2: "siglip_w"}
+        # image_noise_mask: noise mask for condition/target images
+        common_inputs["image_noise_mask"] = {0: "batch_size", 1: "num_images"}
         return common_inputs
     
     @property

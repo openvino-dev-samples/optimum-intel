@@ -4512,9 +4512,9 @@ class LFM2OpenVINOConfig(MambaOpenVINOConfig):
         return common_inputs
 class DummyZImageTransformerInputGenerator(DummyInputGenerator):
     SUPPORTED_INPUT_NAMES = (
-        "hidden_states",
-        "encoder_hidden_states",
-        "timestep",
+        "x",
+        "cap_feats",
+        "t",
     )
 
     def __init__(
@@ -4540,13 +4540,13 @@ class DummyZImageTransformerInputGenerator(DummyInputGenerator):
             self.cap_feat_dim = normalized_config.cap_feat_dim
 
     def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
-        if input_name == "hidden_states":
+        if input_name == "x":
             shape = [self.batch_size, self.num_channels * 4, 1, self.height * 4, self.width * 4]
             return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
-        if input_name == "encoder_hidden_states":
+        if input_name == "cap_feats":
             shape = [self.batch_size, self.sequence_length, self.cap_feat_dim]
             return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
-        if input_name == "timestep":
+        if input_name == "t":
             return self.random_float_tensor([1], max_value=1, min_value=0, framework=framework, dtype=float_dtype)
 
         return super().generate(input_name, framework, int_dtype, float_dtype)
@@ -4562,9 +4562,9 @@ class ZTransformerOpenVINOConfig(OnnxConfig):
     @property
     def inputs(self):
         common_inputs = {}
-        common_inputs["hidden_states"] = {0: "batch_size", 2: "num_frames", 3: "height", 4: "width"}
-        common_inputs["encoder_hidden_states"] =  {0: "batch_size", 1: "seq_len"}
-        common_inputs["timestep"] = {0: "batch_size"}
+        common_inputs["x"] = {0: "batch_size", 2: "num_frames", 3: "height", 4: "width"}
+        common_inputs["cap_feats"] =  {0: "batch_size", 1: "seq_len"}
+        common_inputs["t"] = {0: "batch_size"}
         return common_inputs
     
     @property
@@ -4585,11 +4585,10 @@ class DummyZImageOmniTransformerInputGenerator(DummyInputGenerator):
     """Dummy input generator for ZImageOmniPipeline transformer (with condition images)."""
     
     SUPPORTED_INPUT_NAMES = (
-        "hidden_states",
-        "condition_hidden_states",
-        "encoder_hidden_states",
-        "timestep",
-        "siglip_embeds",
+        "x",
+        "cap_feats",
+        "t",
+        "siglip_feats",
     )
 
     def __init__(
@@ -4617,27 +4616,31 @@ class DummyZImageOmniTransformerInputGenerator(DummyInputGenerator):
         self.siglip_hidden_dim = getattr(normalized_config, "siglip_hidden_dim", 1152)
 
     def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
-        if input_name == "hidden_states":
-            # Target latent: [B, C, 1, H, W]
-            shape = [self.batch_size, self.num_channels * 4, 1, self.height * 4, self.width * 4]
-            return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
-        if input_name == "condition_hidden_states":
-            # Condition image latent: [B, C, 1, H, W]
-            shape = [self.batch_size, self.num_channels * 4, 1, self.height * 4, self.width * 4]
-            return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
-        if input_name == "encoder_hidden_states":
+        if input_name == "x":
+            # For omni mode: List[List[Tensor]] with [[cond_img, target_img], ...]
+            # Condition image latent
+            cond_shape = [self.batch_size, self.num_channels * 4, 1, self.height * 4, self.width * 4]
+            cond_img = self.random_float_tensor(cond_shape, framework=framework, dtype=float_dtype)
+            # Target image latent
+            target_shape = [self.batch_size, self.num_channels * 4, 1, self.height * 4, self.width * 4]
+            target_img = self.random_float_tensor(target_shape, framework=framework, dtype=float_dtype)
+            # Return as list of lists
+            return [[cond_img, target_img]]
+        if input_name == "cap_feats":
             # Text embeddings: [B, seq_len, dim]
             shape = [self.batch_size, self.sequence_length, self.cap_feat_dim]
             return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
-        if input_name == "timestep":
+        if input_name == "t":
             return self.random_float_tensor([self.batch_size], max_value=1, min_value=0, framework=framework, dtype=float_dtype)
-        if input_name == "siglip_embeds":
+        if input_name == "siglip_feats":
+            # For omni mode: List[List[Tensor]] with [[siglip, None], ...]
             # Siglip features: [B, H_sig, W_sig, C_sig]
-            # Using typical siglip output shape (e.g., 27x27 for 378x378 input)
             siglip_h = self.height * 4 // 14  # approximate siglip spatial size
             siglip_w = self.width * 4 // 14
             shape = [self.batch_size, siglip_h, siglip_w, self.siglip_hidden_dim]
-            return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
+            siglip_tensor = self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
+            # Return as list of lists with None for target image
+            return [[siglip_tensor, None]]
 
         return super().generate(input_name, framework, int_dtype, float_dtype)
 
@@ -4655,16 +4658,15 @@ class ZOmniTransformerOpenVINOConfig(OnnxConfig):
     @property
     def inputs(self):
         common_inputs = {}
-        # Target latent
-        common_inputs["hidden_states"] = {0: "batch_size", 2: "num_frames", 3: "height", 4: "width"}
-        # Condition image latent
-        common_inputs["condition_hidden_states"] = {0: "batch_size", 2: "num_frames", 3: "cond_height", 4: "cond_width"}
+        # x: List[List[Tensor]] with [[cond_img, target_img], ...]
+        # For export, we flatten to separate inputs for condition and target
+        common_inputs["x"] = {0: "batch_size", 2: "num_frames", 3: "height", 4: "width"}
         # Text embeddings
-        common_inputs["encoder_hidden_states"] = {0: "batch_size", 1: "seq_len"}
+        common_inputs["cap_feats"] = {0: "batch_size", 1: "seq_len"}
         # Timestep
-        common_inputs["timestep"] = {0: "batch_size"}
-        # Siglip features
-        common_inputs["siglip_embeds"] = {0: "batch_size", 1: "siglip_h", 2: "siglip_w"}
+        common_inputs["t"] = {0: "batch_size"}
+        # siglip_feats: List[List[Tensor]] with [[siglip, None], ...]
+        common_inputs["siglip_feats"] = {0: "batch_size", 1: "siglip_h", 2: "siglip_w"}
         return common_inputs
     
     @property

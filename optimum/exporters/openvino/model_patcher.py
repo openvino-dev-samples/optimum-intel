@@ -3334,151 +3334,283 @@ def pad_sequence(sequences, batch_first=False, padding_value=0.0):
     
     return out_tensor
 
+def _zimage_prepare_sequence(
+    self,
+    feats: List[torch.Tensor],
+    pos_ids: List[torch.Tensor],
+    inner_pad_mask: List[torch.Tensor],
+    pad_token: torch.nn.Parameter,
+    noise_mask: Optional[List[List[int]]] = None,
+    device: torch.device = None,
+):
+    """Prepare sequence: apply pad token, RoPE embed, pad to batch, create attention mask."""
+    item_seqlens = [f.shape[0] for f in feats]
+    max_seqlen = max(item_seqlens)
+    bsz = len(feats)
+
+    # Pad token
+    feats_cat = torch.cat(feats, dim=0)
+    
+    cap_feats_mask = torch.cat(inner_pad_mask)
+    feats_cat = torch.where(cap_feats_mask.unsqueeze(-1), pad_token, feats_cat)
+    
+    feats = list(feats_cat.split(item_seqlens, dim=0))
+
+    # RoPE
+    freqs_cis = list(self.rope_embedder(torch.cat(pos_ids, dim=0)).split([p.shape[0] for p in pos_ids], dim=0))
+
+    # Pad to batch
+    feats = pad_sequence(feats, batch_first=True, padding_value=0.0)
+    freqs_cis = pad_sequence(freqs_cis, batch_first=True, padding_value=0.0)[:, : feats.shape[1]]
+
+    # Attention mask
+    attn_mask = torch.zeros((bsz, max_seqlen), dtype=torch.bool, device=device)
+    for i, seq_len in enumerate(item_seqlens):
+        attn_mask[i, :seq_len] = 1
+
+    # Noise mask
+    noise_mask_tensor = None
+    if noise_mask is not None:
+        noise_mask_tensor = pad_sequence(
+            [torch.tensor(m, dtype=torch.long, device=device) for m in noise_mask],
+            batch_first=True,
+            padding_value=0,
+        )[:, : feats.shape[1]]
+
+    return feats, freqs_cis, attn_mask, item_seqlens, noise_mask_tensor
+
+def _zimage_build_unified_sequence(
+    self,
+    x: torch.Tensor,
+    x_freqs: torch.Tensor,
+    x_seqlens: List[int],
+    x_noise_mask: Optional[List[List[int]]],
+    cap: torch.Tensor,
+    cap_freqs: torch.Tensor,
+    cap_seqlens: List[int],
+    cap_noise_mask: Optional[List[List[int]]],
+    siglip: Optional[torch.Tensor],
+    siglip_freqs: Optional[torch.Tensor],
+    siglip_seqlens: Optional[List[int]],
+    siglip_noise_mask: Optional[List[List[int]]],
+    omni_mode: bool,
+    device: torch.device,
+):
+    """Build unified sequence: x, cap, and optionally siglip.
+    Basic mode order: [x, cap]; Omni mode order: [cap, x, siglip]
+    """
+    bsz = len(x_seqlens)
+    unified = []
+    unified_freqs = []
+    unified_noise_mask = []
+
+    for i in range(bsz):
+        x_len, cap_len = x_seqlens[i], cap_seqlens[i]
+
+        if omni_mode:
+            # Omni: [cap, x, siglip]
+            if siglip is not None and siglip_seqlens is not None:
+                sig_len = siglip_seqlens[i]
+                unified.append(torch.cat([cap[i][:cap_len], x[i][:x_len], siglip[i][:sig_len]]))
+                unified_freqs.append(
+                    torch.cat([cap_freqs[i][:cap_len], x_freqs[i][:x_len], siglip_freqs[i][:sig_len]])
+                )
+                unified_noise_mask.append(
+                    torch.tensor(
+                        cap_noise_mask[i] + x_noise_mask[i] + siglip_noise_mask[i], dtype=torch.long, device=device
+                    )
+                )
+            else:
+                unified.append(torch.cat([cap[i][:cap_len], x[i][:x_len]]))
+                unified_freqs.append(torch.cat([cap_freqs[i][:cap_len], x_freqs[i][:x_len]]))
+                unified_noise_mask.append(
+                    torch.tensor(cap_noise_mask[i] + x_noise_mask[i], dtype=torch.long, device=device)
+                )
+        else:
+            # Basic: [x, cap]
+            unified.append(torch.cat([x[i][:x_len], cap[i][:cap_len]]))
+            unified_freqs.append(torch.cat([x_freqs[i][:x_len], cap_freqs[i][:cap_len]]))
+
+    # Compute unified seqlens
+    if omni_mode:
+        if siglip is not None and siglip_seqlens is not None:
+            unified_seqlens = [a + b + c for a, b, c in zip(cap_seqlens, x_seqlens, siglip_seqlens)]
+        else:
+            unified_seqlens = [a + b for a, b in zip(cap_seqlens, x_seqlens)]
+    else:
+        unified_seqlens = [a + b for a, b in zip(x_seqlens, cap_seqlens)]
+
+    max_seqlen = max(unified_seqlens)
+
+    # Pad to batch
+    unified = pad_sequence(unified, batch_first=True, padding_value=0.0)
+    unified_freqs = pad_sequence(unified_freqs, batch_first=True, padding_value=0.0)
+
+    # Attention mask
+    attn_mask = torch.zeros((bsz, max_seqlen), dtype=torch.bool, device=device)
+    for i, seq_len in enumerate(unified_seqlens):
+        attn_mask[i, :seq_len] = 1
+
+    # Noise mask
+    noise_mask_tensor = None
+    if omni_mode:
+        noise_mask_tensor = pad_sequence(unified_noise_mask, batch_first=True, padding_value=0)[
+            :, : unified.shape[1]
+        ]
+
+    return unified, unified_freqs, attn_mask, noise_mask_tensor
+
 def _zimage_forward(
     self,
-    hidden_states,
-    timestep,
-    encoder_hidden_states,
-    condition_hidden_states=None,
-    siglip_embeds=None,
+    x,
+    t,
+    cap_feats,
+    return_dict: bool = True,
+    controlnet_block_samples=None,
+    siglip_feats=None,
+    image_noise_mask=None,
+    patch_size: int = 2,
+    f_patch_size: int = 1,
 ) -> torch.Tensor:
     """
-    Unified forward for ZImage transformer supporting both text-to-image and omni modes.
+    Patched forward for ZImage transformer matching original model signature.
     
-    Text-to-image mode (condition_hidden_states=None, siglip_embeds=None):
-        - hidden_states: [B, C, 1, H, W]
-        - timestep: [B]
-        - encoder_hidden_states: [B, seq_len, dim]
-        
-    Omni mode (with condition images):
-        - hidden_states: Target latent [B, C, 1, H, W]
-        - condition_hidden_states: Condition image latent [B, C, 1, H, W]
-        - timestep: [B]
-        - encoder_hidden_states: Text embeddings [B, seq_len, dim]
-        - siglip_embeds: Siglip features [B, num_patches, C_sig]
+    Args:
+        x: Union[List[torch.Tensor], List[List[torch.Tensor]]]
+            - Text-to-image: List of image tensors [C, 1, H, W]
+            - Omni: List of lists [[cond_img, target_img], ...]
+        t: Timestep tensor [B]
+        cap_feats: Union[List[torch.Tensor], List[List[torch.Tensor]]]
+            - Text-to-image: List of caption features [seq_len, dim]
+            - Omni: List of lists [[cap, cap], ...]
+        return_dict: Whether to return dict (ignored, always returns tensor)
+        controlnet_block_samples: Optional controlnet features (not used in export)
+        siglip_feats: Optional[List[List[torch.Tensor]]]
+            - Omni mode only: List of lists [[siglip, None], ...]
+        image_noise_mask: Optional[List[List[int]]]
+            - Omni mode only: List of lists [[0, 1], ...] marking clean/noisy images
+        patch_size: Patch size (default: 2)
+        f_patch_size: Frame patch size (default: 1)
     """
     # Check if omni mode
-    omni_mode = condition_hidden_states is not None and siglip_embeds is not None
-    
-    if omni_mode:
-        return _zimage_forward_omni(
-            self, hidden_states, condition_hidden_states, timestep, 
-            encoder_hidden_states, siglip_embeds
-        )
-    
-    # Standard text-to-image mode
-    # Convert inputs from batch tensors to lists
-    x = list(torch.unbind(hidden_states, dim=0))
-    t = timestep
-    cap_feats = list(torch.unbind(encoder_hidden_states, dim=0))
-    
-    # Use default patch sizes
-    patch_size = 2
-    f_patch_size = 1
+    omni_mode = isinstance(x[0], list)
     
     assert patch_size in self.all_patch_size
     assert f_patch_size in self.all_f_patch_size
-
-    bsz = len(x)
-    device = x[0].device
-    t = t * self.t_scale
-    t = self.t_embedder(t)
-
-    (
-        x,
-        cap_feats,
-        x_size,
-        x_pos_ids,
-        cap_pos_ids,
-        x_inner_pad_mask,
-        cap_inner_pad_mask,
-    ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
-
-    # x embed & refine
-    x_item_seqlens = [_.shape[0] for _ in x]
-    assert all(_ % 32 == 0 for _ in x_item_seqlens)  # SEQ_MULTI_OF
-    x_max_item_seqlen = max(x_item_seqlens)
-
-    x = torch.cat(x, dim=0)
-    x = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](x)
-
-    # Match t_embedder output dtype to x for layerwise casting compatibility
-    adaln_input = t.type_as(x)
-    x_flat_mask = torch.cat(x_inner_pad_mask)
-    x = torch.where(x_flat_mask.unsqueeze(-1), self.x_pad_token, x)
-    x = list(x.split(x_item_seqlens, dim=0))
-    x_freqs_cis = list(self.rope_embedder(torch.cat(x_pos_ids, dim=0)).split(x_item_seqlens, dim=0))
-
-    x = pad_sequence(x, batch_first=True, padding_value=0.0)
-    x_freqs_cis = pad_sequence(x_freqs_cis, batch_first=True, padding_value=0.0)
-    x_attn_mask = torch.zeros((bsz, x_max_item_seqlen), dtype=torch.bool, device=device)
-    for i, seq_len in enumerate(x_item_seqlens):
-        x_attn_mask[i, :seq_len] = 1
-
-    if torch.is_grad_enabled() and self.gradient_checkpointing:
-        for layer in self.noise_refiner:
-            x = self._gradient_checkpointing_func(layer, x, x_attn_mask, x_freqs_cis, adaln_input)
-    else:
-        for layer in self.noise_refiner:
-            x = layer(x, x_attn_mask, x_freqs_cis, adaln_input)
-
-    # cap embed & refine
-    cap_item_seqlens = [_.shape[0] for _ in cap_feats]
-    assert all(_ % 32 == 0 for _ in cap_item_seqlens)
-    cap_max_item_seqlen = max(cap_item_seqlens)
-
-    cap_feats = torch.cat(cap_feats, dim=0)
-    cap_feats = self.cap_embedder(cap_feats)
-    cap_flat_mask = torch.cat(cap_inner_pad_mask)
-    cap_feats = torch.where(cap_flat_mask.unsqueeze(-1), self.cap_pad_token, cap_feats)
-    cap_feats = list(cap_feats.split(cap_item_seqlens, dim=0))
-    cap_freqs_cis = list(self.rope_embedder(torch.cat(cap_pos_ids, dim=0)).split(cap_item_seqlens, dim=0))
-
-    cap_feats = pad_sequence(cap_feats, batch_first=True, padding_value=0.0)
-    cap_freqs_cis = pad_sequence(cap_freqs_cis, batch_first=True, padding_value=0.0)
-    cap_attn_mask = torch.zeros((bsz, cap_max_item_seqlen), dtype=torch.bool, device=device)
-    for i, seq_len in enumerate(cap_item_seqlens):
-        cap_attn_mask[i, :seq_len] = 1
-
-    if torch.is_grad_enabled() and self.gradient_checkpointing:
-        for layer in self.context_refiner:
-            cap_feats = self._gradient_checkpointing_func(layer, cap_feats, cap_attn_mask, cap_freqs_cis)
-    else:
-        for layer in self.context_refiner:
-            cap_feats = layer(cap_feats, cap_attn_mask, cap_freqs_cis)
-
-    # unified
-    unified = []
-    unified_freqs_cis = []
-    for i in range(bsz):
-        x_len = x_item_seqlens[i]
-        cap_len = cap_item_seqlens[i]
-        unified.append(torch.cat([x[i][:x_len], cap_feats[i][:cap_len]]))
-        unified_freqs_cis.append(torch.cat([x_freqs_cis[i][:x_len], cap_freqs_cis[i][:cap_len]]))
-    unified_item_seqlens = [a + b for a, b in zip(cap_item_seqlens, x_item_seqlens)]
-    assert unified_item_seqlens == [len(_) for _ in unified]
-    unified_max_item_seqlen = max(unified_item_seqlens)
-
-    unified = pad_sequence(unified, batch_first=True, padding_value=0.0)
-    unified_freqs_cis = pad_sequence(unified_freqs_cis, batch_first=True, padding_value=0.0)
-    unified_attn_mask = torch.zeros((bsz, unified_max_item_seqlen), dtype=torch.bool, device=device)
-    for i, seq_len in enumerate(unified_item_seqlens):
-        unified_attn_mask[i, :seq_len] = 1
-
-    if torch.is_grad_enabled() and self.gradient_checkpointing:
-        for layer in self.layers:
-            unified = self._gradient_checkpointing_func(
-                layer, unified, unified_attn_mask, unified_freqs_cis, adaln_input
-            )
-    else:
-        for layer in self.layers:
-            unified = layer(unified, unified_attn_mask, unified_freqs_cis, adaln_input)
-
-    unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](unified, adaln_input)
-    unified = list(unified.unbind(dim=0))
-    x = self.unpatchify(unified, x_size, patch_size, f_patch_size)
     
-    return x[0]  # Return single tensor instead of (x, {})
+    device = x[0][-1].device if omni_mode else x[0].device
+    
+    if omni_mode:
+        # Timestep embeddings: dual for omni mode
+        t_noisy = self.t_embedder(t * self.t_scale).type_as(x[0][-1])
+        t_clean = self.t_embedder(torch.ones_like(t) * self.t_scale).type_as(x[0][-1])
+        adaln_input = None
+        
+        # Patchify and embed
+        (
+            x,
+            cap_feats,
+            siglip_feats,
+            x_size,
+            x_pos_ids,
+            cap_pos_ids,
+            siglip_pos_ids,
+            x_pad_mask,
+            cap_pad_mask,
+            siglip_pad_mask,
+            x_pos_offsets,
+            x_noise_mask,
+            cap_noise_mask,
+            siglip_noise_mask,
+        ) = self.patchify_and_embed_omni(
+            x, cap_feats, siglip_feats, patch_size, f_patch_size, image_noise_mask
+        )
+    else:
+        # Standard text-to-image mode
+        # Single embedding for all tokens
+        adaln_input = self.t_embedder(t * self.t_scale).type_as(x[0])
+        t_noisy = t_clean = None
+        
+        (
+            x,
+            cap_feats,
+            x_size,
+            x_pos_ids,
+            cap_pos_ids,
+            x_pad_mask,
+            cap_pad_mask,
+        ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
+        
+        x_pos_offsets = x_noise_mask = cap_noise_mask = siglip_noise_mask = None
+        siglip_feats = siglip_pos_ids = siglip_pad_mask = None
+
+    # X embed & refine
+    x_seqlens = [xi.shape[0] for xi in x]
+    x = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](torch.cat(x, dim=0))
+    x, x_freqs, x_mask, _, x_noise_tensor = self._prepare_sequence(
+        list(x.split(x_seqlens, dim=0)), x_pos_ids, x_pad_mask, self.x_pad_token, x_noise_mask, device
+    )
+    
+    for layer in self.noise_refiner:
+        x = layer(x, x_mask, x_freqs, adaln_input, x_noise_tensor, t_noisy, t_clean)
+    
+    # Cap embed & refine
+    cap_seqlens = [ci.shape[0] for ci in cap_feats]
+    cap_feats = self.cap_embedder(torch.cat(cap_feats, dim=0))
+    cap_feats, cap_freqs, cap_mask, _, _ = self._prepare_sequence(
+        list(cap_feats.split(cap_seqlens, dim=0)), cap_pos_ids, cap_pad_mask, self.cap_pad_token, None, device
+    )
+    
+    for layer in self.context_refiner:
+        cap_feats = layer(cap_feats, cap_mask, cap_freqs)
+    
+    # Siglip embed & refine (omni mode only)
+    siglip_seqlens = None
+    siglip_freqs = None
+    if omni_mode and siglip_feats[0] is not None and self.siglip_embedder is not None:
+        siglip_seqlens = [si.shape[0] for si in siglip_feats]
+        siglip_feats = self.siglip_embedder(torch.cat(siglip_feats, dim=0))
+        siglip_feats, siglip_freqs, siglip_mask, _, _ = self._prepare_sequence(
+            list(siglip_feats.split(siglip_seqlens, dim=0)),
+            siglip_pos_ids,
+            siglip_pad_mask,
+            self.siglip_pad_token,
+            None,
+            device,
+        )
+        
+        for layer in self.siglip_refiner:
+            siglip_feats = layer(siglip_feats, siglip_mask, siglip_freqs)
+    
+    # Build unified sequence
+    unified, unified_freqs, unified_mask, unified_noise_tensor = self._build_unified_sequence(
+        x, x_freqs, x_seqlens, x_noise_mask,
+        cap_feats, cap_freqs, cap_seqlens, cap_noise_mask,
+        siglip_feats, siglip_freqs, siglip_seqlens, siglip_noise_mask,
+        omni_mode,
+        device,
+    )
+    
+    # Main transformer layers
+    for layer in self.layers:
+        unified = layer(unified, unified_mask, unified_freqs, adaln_input, unified_noise_tensor, t_noisy, t_clean)
+    
+    # Final layer
+    if omni_mode:
+        unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](
+            unified, noise_mask=unified_noise_tensor, c_noisy=t_noisy, c_clean=t_clean
+        )
+    else:
+        unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](unified, c=adaln_input)
+    
+    # Unpatchify
+    x_out = self.unpatchify(list(unified.unbind(dim=0)), x_size, patch_size, f_patch_size, x_pos_offsets)
+    
+    # Return single tensor
+    if omni_mode:
+        return torch.stack(x_out, dim=0)
+    else:
+        return x_out[0]
 
 
 def _zimage_rope_embedder_precompute_freqs_cis(dim: List[int], end: List[int], theta: float = 256.0):
@@ -3683,6 +3815,12 @@ class ZImageTransformerModelPatcher(ModelPatcher):
         from diffusers.models.transformers import transformer_z_image
         self._orig_RopeEmbedder = transformer_z_image.RopeEmbedder
         self._orig_ZSingleStreamAttnProcessor = transformer_z_image.ZSingleStreamAttnProcessor
+        
+        # Replace pad_sequence with custom implementation
+        
+        # Store original methods for restoration
+        self._orig_prepare_sequence = self._model._prepare_sequence
+        self._orig_build_unified_sequence = self._model._build_unified_sequence
 
         class PatchedRopeEmbedder(self._orig_RopeEmbedder):
             def __init__(
@@ -3736,6 +3874,10 @@ class ZImageTransformerModelPatcher(ModelPatcher):
         self._model.forward = types.MethodType(_zimage_forward, self._model)
         self._model.patchify_and_embed = types.MethodType(
             _zimage_patchify_and_embed, self._model)
+        
+        # Replace _prepare_sequence and _build_unified_sequence with custom implementations
+        self._model._prepare_sequence = types.MethodType(_zimage_prepare_sequence, self._model)
+        self._model._build_unified_sequence = types.MethodType(_zimage_build_unified_sequence, self._model)
 
     def __exit__(self, exc_type, exc_value, traceback):
         super().__exit__(exc_type, exc_value, traceback)
@@ -3747,6 +3889,7 @@ class ZImageTransformerModelPatcher(ModelPatcher):
         self._model.rope_embedder = self._orig_rope_embedder
         self._model.forward = self._orig_forward
         self._model.patchify_and_embed = self._orig_patchify_and_embed
+        self._model._build_unified_sequence = self._orig_build_unified_sequence
         
         for layer in self._model.noise_refiner:
             layer.attention.processor = layer.attention._orig_processor
@@ -3758,65 +3901,6 @@ class ZImageTransformerModelPatcher(ModelPatcher):
             layer.attention.processor = layer.attention._orig_processor
 
 
-def _zimage_forward_omni(
-    self,
-    hidden_states,
-    condition_hidden_states,
-    timestep,
-    encoder_hidden_states,
-    siglip_embeds,
-) -> torch.Tensor:
-    """
-    Forward for ZImageOmniPipeline with packed tensor inputs.
-    Converts packed tensor inputs to the list format expected by the original model.
-    
-    Args:
-        hidden_states: Target latent [B, C, 1, H, W]
-        condition_hidden_states: Condition image latent [B, C, 1, H, W] 
-        timestep: Timestep [B]
-        encoder_hidden_states: Text embeddings [B, seq_len, dim]
-        siglip_embeds: Siglip features [B, H_sig, W_sig, C_sig]
-        
-    Note: This assumes single condition image per batch item.
-    """
-    bsz = hidden_states.shape[0]
-    
-    # Build x_combined: List[List[Tensor]] - [condition image, target image] per batch
-    x_combined = []
-    for i in range(bsz):
-        cond_img = condition_hidden_states[i]  # [C, 1, H, W]
-        target_img = hidden_states[i]  # [C, 1, H, W]
-        x_combined.append([cond_img, target_img])
-    
-    # Build cap_feats: List[List[Tensor]] - duplicate text for condition and target
-    cap_feats = []
-    for i in range(bsz):
-        cap = encoder_hidden_states[i]  # [seq_len, dim]
-        cap_feats.append([cap, cap])  # same caption for cond and target
-    
-    # Build siglip_feats: List[List[Tensor | None]] - siglip for condition, None for target
-    siglip_feats = []
-    for i in range(bsz):
-        # siglip_embeds shape: [B, H_sig, W_sig, C_sig]
-        sig = siglip_embeds[i]  # [H_sig, W_sig, C_sig]
-        siglip_feats.append([sig, None])  # siglip for cond, None for target
-    
-    # Build image_noise_mask: List[List[int]]
-    image_noise_mask = [[0, 1] for _ in range(bsz)]  # 0=clean(cond), 1=noisy(target)
-    
-    # Call original model forward with omni mode inputs
-    # Note: We use the patched forward's underlying original forward
-    result = self._orig_forward(
-        x=x_combined,
-        t=timestep,
-        cap_feats=cap_feats,
-        siglip_feats=siglip_feats,
-        image_noise_mask=image_noise_mask,
-        return_dict=False,
-    )[0]
-    
-    # result is List[Tensor], stack back to batch
-    return torch.stack(result, dim=0)
 
 
 def _minicpmv_resampler_forward(self, image_feature, pos_embed, key_padding_mask):

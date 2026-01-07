@@ -134,6 +134,7 @@ else:
 
 DIFFUSION_MODEL_TRANSFORMER_SUBFOLDER = "transformer"
 DIFFUSION_MODEL_TEXT_ENCODER_3_SUBFOLDER = "text_encoder_3"
+DIFFUSION_MODEL_SIGLIP_SUBFOLDER = "siglip"
 
 core = Core()
 
@@ -159,6 +160,7 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
         text_encoder_2: Optional[openvino.Model] = None,
         text_encoder_3: Optional[openvino.Model] = None,
         transformer: Optional[openvino.Model] = None,
+        siglip: Optional[openvino.Model] = None,
         # optional pipeline submodels
         tokenizer: Optional[CLIPTokenizer] = None,
         tokenizer_2: Optional[CLIPTokenizer] = None,
@@ -235,6 +237,11 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
             if text_encoder_3 is not None
             else None
         )
+        self.siglip = (
+            OVModelSiglip(siglip, self, DIFFUSION_MODEL_SIGLIP_SUBFOLDER)
+            if siglip is not None
+            else None
+        )
         # We wrap the VAE Decoder & Encoder in a single object to simulate diffusers API
         self.vae = OVModelVae(decoder=self.vae_decoder, encoder=self.vae_encoder)
 
@@ -255,6 +262,7 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
             "text_encoder": self.text_encoder,
             "text_encoder_2": self.text_encoder_2,
             "text_encoder_3": self.text_encoder_3,
+            "siglip": self.siglip,
             "safety_checker": self.safety_checker,
             "image_encoder": self.image_encoder,
             "scheduler": self.scheduler,
@@ -297,6 +305,7 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
             "text_encoder",
             "text_encoder_2",
             "text_encoder_3",
+            "siglip",
         ]
         component_names = [name for name in component_name_candidates if getattr(self, name) is not None]
         return component_names
@@ -333,6 +342,7 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
             (self.text_encoder_2, save_directory / DIFFUSION_MODEL_TEXT_ENCODER_2_SUBFOLDER),
             (self.text_encoder_3, save_directory / DIFFUSION_MODEL_TEXT_ENCODER_3_SUBFOLDER),
             (self.transformer, save_directory / DIFFUSION_MODEL_TRANSFORMER_SUBFOLDER),
+            (self.siglip, save_directory / DIFFUSION_MODEL_SIGLIP_SUBFOLDER),
         }
         for model, save_path in models_to_save_paths:
             if model is not None:
@@ -406,6 +416,7 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
         text_encoder_2_file_name: Optional[str] = None,
         text_encoder_3_file_name: Optional[str] = None,
         transformer_file_name: Optional[str] = None,
+        siglip_file_name: Optional[str] = None,
         from_onnx: bool = False,
         load_in_8bit: bool = False,
         quantization_config: Union[OVWeightQuantizationConfig, Dict] = None,
@@ -429,6 +440,7 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
         text_encoder_2_file_name = text_encoder_2_file_name or default_file_name
         text_encoder_3_file_name = text_encoder_3_file_name or default_file_name
         transformer_file_name = transformer_file_name or default_file_name
+        siglip_file_name = siglip_file_name or default_file_name
 
         if not os.path.isdir(str(model_id)):
             all_components = {key for key in config.keys() if not key.startswith("_")} | {"vae_encoder", "vae_decoder"}
@@ -442,6 +454,7 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
                     text_encoder_file_name,
                     text_encoder_2_file_name,
                     text_encoder_3_file_name,
+                    siglip_file_name,
                     unet_file_name.replace(".xml", ".bin"),
                     transformer_file_name.replace(".xml", ".bin"),
                     vae_encoder_file_name.replace(".xml", ".bin"),
@@ -449,6 +462,7 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
                     text_encoder_file_name.replace(".xml", ".bin"),
                     text_encoder_2_file_name.replace(".xml", ".bin"),
                     text_encoder_3_file_name.replace(".xml", ".bin"),
+                    siglip_file_name.replace(".xml", ".bin"),
                     SCHEDULER_CONFIG_NAME,
                     cls.config_name,
                     CONFIG_NAME,
@@ -519,6 +533,7 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
             "text_encoder": model_save_path / DIFFUSION_MODEL_TEXT_ENCODER_SUBFOLDER / text_encoder_file_name,
             "text_encoder_2": model_save_path / DIFFUSION_MODEL_TEXT_ENCODER_2_SUBFOLDER / text_encoder_2_file_name,
             "text_encoder_3": model_save_path / DIFFUSION_MODEL_TEXT_ENCODER_3_SUBFOLDER / text_encoder_3_file_name,
+            "siglip": model_save_path / DIFFUSION_MODEL_SIGLIP_SUBFOLDER / siglip_file_name,
         }
 
         for config_key, value in config.items():
@@ -1204,6 +1219,38 @@ class OVModelTextEncoder(OVPipelinePart):
         ):
             hidden_states = [torch.from_numpy(ov_outputs[out_name]) for out_name in self.hidden_states_output_names]
             model_outputs["hidden_states"] = hidden_states
+
+        if return_dict:
+            return model_outputs
+        return ModelOutput(**model_outputs)
+
+
+class OVModelSiglip(OVPipelinePart):
+    def __init__(self, model: openvino.Model, parent_pipeline: OVDiffusionPipeline, model_name: str = ""):
+        super().__init__(model, parent_pipeline, model_name)
+        self.input_names = [inp.get_any_name() for inp in self.model.inputs]
+
+    def forward(
+        self,
+        pixel_values: Union[np.ndarray, torch.Tensor],
+        output_hidden_states: Optional[bool] = None,
+        return_dict: bool = False,
+    ):
+        self.compile()
+        model_inputs = {"pixel_values": pixel_values}
+
+        ov_outputs = self.request(model_inputs, share_inputs=True)
+        model_outputs = {}
+        
+        # Main output (image embeddings)
+        model_outputs[self.model.outputs[0].get_any_name()] = torch.from_numpy(ov_outputs[0])
+        
+        # Check for additional outputs like pooler_output or last_hidden_state
+        if len(self.model.outputs) > 1:
+            for idx, output in enumerate(self.model.outputs[1:], start=1):
+                output_name = output.get_any_name()
+                if "pooler_output" in output_name or "last_hidden_state" in output_name:
+                    model_outputs[output_name] = torch.from_numpy(ov_outputs[idx])
 
         if return_dict:
             return model_outputs

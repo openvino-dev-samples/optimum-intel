@@ -3501,9 +3501,9 @@ def _zimage_build_unified_sequence(
 
 def _zimage_forward(
     self,
-    x,
-    t,
-    cap_feats,
+    hidden_states,
+    timestep,
+    encoder_hidden_states,
     return_dict: bool = True,
     controlnet_block_samples=None,
     siglip_feats=None,
@@ -3515,12 +3515,12 @@ def _zimage_forward(
     Patched forward for ZImage transformer matching original model signature.
     
     Args:
-        x: Union[List[torch.Tensor], List[List[torch.Tensor]], torch.Tensor]
+        hidden_states: Union[List[torch.Tensor], List[List[torch.Tensor]], torch.Tensor]
             - Text-to-image: List of image tensors [C, 1, H, W]
             - Omni: List of lists [[cond_img, target_img], ...]
             - Export (omni): Stacked tensor [2, B, C, 1, H, W] that will be converted to list format
-        t: Timestep tensor [B]
-        cap_feats: Union[List[torch.Tensor], List[List[torch.Tensor]]]
+        timestep: Timestep tensor [B]
+        encoder_hidden_states: Union[List[torch.Tensor], List[List[torch.Tensor]]]
             - Text-to-image: List of caption features [seq_len, dim]
             - Omni: List of lists [[cap, cap], ...]
         return_dict: Whether to return dict (ignored, always returns tensor)
@@ -3534,13 +3534,13 @@ def _zimage_forward(
         f_patch_size: Frame patch size (default: 1)
     """
     # Convert tensor inputs to list format for omni mode (from export)
-    if isinstance(x, torch.Tensor) and x.ndim == 6 and x.shape[0] == 2:
-        # x is [2, B, C, 1, H, W] from export, convert to [[cond, target]]
-        x = [list(torch.unbind(x, dim=0))]
+    if isinstance(hidden_states, torch.Tensor) and hidden_states.ndim == 6 and hidden_states.shape[0] == 2:
+        # hidden_states is [2, B, C, 1, H, W] from export, convert to [[cond, target]]
+        hidden_states = [list(torch.unbind(hidden_states, dim=0))]
         omni_mode = True
     else:
         # Check if omni mode from list structure
-        omni_mode = isinstance(x[0], list)
+        omni_mode = isinstance(hidden_states[0], list)
     
     # Convert siglip_feats tensor to list format for omni mode
     if omni_mode and siglip_feats is not None and isinstance(siglip_feats, torch.Tensor):
@@ -3560,8 +3560,8 @@ def _zimage_forward(
     
     if omni_mode:
         # Timestep embeddings: dual for omni mode
-        t_noisy = self.t_embedder(t * self.t_scale).type_as(x[0][-1])
-        t_clean = self.t_embedder(torch.ones_like(t) * self.t_scale).type_as(x[0][-1])
+        t_noisy = self.t_embedder(timestep * self.t_scale).type_as(hidden_states[0][-1])
+        t_clean = self.t_embedder(torch.ones_like(timestep) * self.t_scale).type_as(hidden_states[0][-1])
         adaln_input = None
         
         # Patchify and embed
@@ -3581,12 +3581,12 @@ def _zimage_forward(
             cap_noise_mask,
             siglip_noise_mask,
         ) = self.patchify_and_embed_omni(
-            x, cap_feats, siglip_feats, patch_size, f_patch_size, image_noise_mask
+            hidden_states, encoder_hidden_states, siglip_feats, patch_size, f_patch_size, image_noise_mask
         )
     else:
         # Standard text-to-image mode
         # Single embedding for all tokens
-        adaln_input = self.t_embedder(t * self.t_scale).type_as(x[0])
+        adaln_input = self.t_embedder(timestep * self.t_scale).type_as(hidden_states[0])
         t_noisy = t_clean = None
         
         (
@@ -3597,7 +3597,7 @@ def _zimage_forward(
             cap_pos_ids,
             x_pad_mask,
             cap_pad_mask,
-        ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
+        ) = self.patchify_and_embed(hidden_states, encoder_hidden_states, patch_size, f_patch_size)
         
         x_pos_offsets = x_noise_mask = cap_noise_mask = siglip_noise_mask = None
         siglip_feats = siglip_pos_ids = siglip_pad_mask = None

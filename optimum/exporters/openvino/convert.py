@@ -726,6 +726,12 @@ def export_from_model(
         tokenizer_3 = getattr(model, "tokenizer_3", None)
         if tokenizer_3 is not None:
             tokenizer_3.save_pretrained(output.joinpath("tokenizer_3"))
+        
+        # Save siglip_processor if available (for ZImageOmniPipeline)
+        siglip_processor = getattr(model, "siglip_processor", None)
+        if siglip_processor is not None:
+            siglip_processor.save_pretrained(output.joinpath("siglip_processor"))
+        
         safety_checker = getattr(model, "safety_checker", None)
         if safety_checker is not None:
             safety_checker.save_pretrained(output.joinpath("safety_checker"))

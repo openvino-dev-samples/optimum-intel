@@ -166,6 +166,7 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
         tokenizer_2: Optional[CLIPTokenizer] = None,
         tokenizer_3: Optional[CLIPTokenizer] = None,
         feature_extractor: Optional[CLIPFeatureExtractor] = None,
+        siglip_processor: Optional[Any] = None,
         # stable diffusion xl specific arguments
         force_zeros_for_empty_prompt: bool = True,
         requires_aesthetics_score: bool = False,
@@ -250,6 +251,7 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
         self.tokenizer_2 = tokenizer_2
         self.tokenizer_3 = tokenizer_3
         self.feature_extractor = feature_extractor
+        self.siglip_processor = siglip_processor
 
         # we allow passing these as torch models for now
         self.image_encoder = kwargs.pop("image_encoder", None)  # TODO: maybe mplement OVModelImageEncoder
@@ -263,6 +265,7 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
             "text_encoder_2": self.text_encoder_2,
             "text_encoder_3": self.text_encoder_3,
             "siglip": self.siglip,
+            "siglip_processor": self.siglip_processor,
             "safety_checker": self.safety_checker,
             "image_encoder": self.image_encoder,
             "scheduler": self.scheduler,
@@ -499,6 +502,7 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
             "feature_extractor": None,
             "safety_checker": None,
             "image_encoder": None,
+            "siglip_processor": None,
         }
         for name in submodels.keys():
             if name in kwargs:
@@ -796,10 +800,19 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
                 batch_size *= 2
 
         is_ltx = self.__class__.__name__.startswith("OVLTX")
+        is_zimage = "ZImage" in self.__class__.__name__
+        
         if is_ltx:
             height = height // self.vae_spatial_compression_ratio if height > 0 else -1
             width = width // self.vae_spatial_compression_ratio if width > 0 else -1
             packed_height_width = width * height * num_frames if height > 0 and width > 0 and num_frames > 0 else -1
+        elif is_zimage:
+            # ZImage models: height and width are divided by 4 (latent space compression)
+            height = height // 4 if height > 0 else height
+            width = width // 4 if width > 0 else width
+            packed_height = height // 2 if height > 0 else height
+            packed_width = width // 2 if width > 0 else width
+            packed_height_width = packed_width * packed_height if height > 0 and width > 0 else -1
         else:
             height = height // self.vae_scale_factor if height > 0 else height
             width = width // self.vae_scale_factor if width > 0 else width
@@ -810,9 +823,37 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
         shapes = {}
         for inputs in model.inputs:
             shapes[inputs] = inputs.get_partial_shape()
-            if inputs.get_any_name() in ["timestep", "guidance"]:
+            input_name = inputs.get_any_name()
+            
+            # Handle ZImage-specific inputs
+            if is_zimage:
+                if input_name == "x":
+                    # x: latent representation [B, C, H/4, W/4]
+                    in_channels = self.transformer.config.get("in_channels", None)
+                    if in_channels is None:
+                        in_channels = shapes[inputs][1] if inputs.get_partial_shape().rank.get_length() == 4 else 4
+                    shapes[inputs] = [batch_size, in_channels, height, width]
+                elif input_name == "t":
+                    # timestep
+                    shapes[inputs] = [batch_size]
+                elif input_name == "cap_feats":
+                    # text embeddings: [B, seq_len, cap_feat_dim]
+                    text_dim = self.transformer.config.get("cap_feat_dim", 2560)
+                    shapes[inputs] = [batch_size, tokenizer_max_length, text_dim]
+                elif input_name == "siglip_feats":
+                    # siglip features [B, H_sig, W_sig, C_sig]
+                    siglip_h = height // 2 if height > 0 else -1
+                    siglip_w = width // 2 if width > 0 else -1
+                    siglip_c = self.transformer.config.get("siglip_feat_dim", 1152)
+                    shapes[inputs] = [batch_size, siglip_h, siglip_w, siglip_c]
+                elif input_name == "image_noise_mask":
+                    # noise mask for condition/target images
+                    shapes[inputs] = [batch_size, 2]
+                else:
+                    shapes[inputs][0] = batch_size
+            elif input_name in ["timestep", "guidance"]:
                 shapes[inputs][0] = batch_size
-            elif inputs.get_any_name() == "hidden_states":
+            elif input_name == "hidden_states":
                 in_channels = self.transformer.config.get("in_channels", None)
                 if in_channels is None:
                     in_channels = (
@@ -830,17 +871,17 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
                 else:
                     shapes[inputs] = [batch_size, packed_height_width, in_channels]
 
-            elif inputs.get_any_name() == "pooled_projections":
+            elif input_name == "pooled_projections":
                 shapes[inputs] = [batch_size, self.transformer.config["pooled_projection_dim"]]
-            elif inputs.get_any_name() == "img_ids":
+            elif input_name == "img_ids":
                 shapes[inputs] = (
                     [batch_size, packed_height_width, 3]
                     if is_diffusers_version("<", "0.31.0")
                     else [packed_height_width, 3]
                 )
-            elif inputs.get_any_name() == "txt_ids":
+            elif input_name == "txt_ids":
                 shapes[inputs] = [batch_size, -1, 3] if is_diffusers_version("<", "0.31.0") else [-1, 3]
-            elif inputs.get_any_name() in ["height", "width", "num_frames", "rope_interpolation_scale"]:
+            elif input_name in ["height", "width", "num_frames", "rope_interpolation_scale"]:
                 shapes[inputs] = inputs.get_partial_shape()
             else:
                 shapes[inputs][0] = batch_size
@@ -1233,23 +1274,33 @@ class OVModelSiglip(OVPipelinePart):
     def forward(
         self,
         pixel_values: Union[np.ndarray, torch.Tensor],
+        pixel_attention_mask: Optional[Union[np.ndarray, torch.Tensor]] = None,
+        spatial_shapes: Optional[Union[np.ndarray, torch.Tensor]] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: bool = False,
+        **kwargs,
     ):
         self.compile()
         model_inputs = {"pixel_values": pixel_values}
 
+        # Add optional inputs if provided and present in model
+        if pixel_attention_mask is not None and "pixel_attention_mask" in self.input_names:
+            model_inputs["pixel_attention_mask"] = pixel_attention_mask
+        
+        if spatial_shapes is not None and "spatial_shapes" in self.input_names:
+            model_inputs["spatial_shapes"] = spatial_shapes
+
         ov_outputs = self.request(model_inputs, share_inputs=True)
         model_outputs = {}
         
-        # Main output (image embeddings)
+        # Main output (image embeddings / last_hidden_state)
         model_outputs[self.model.outputs[0].get_any_name()] = torch.from_numpy(ov_outputs[0])
         
-        # Check for additional outputs like pooler_output or last_hidden_state
+        # Check for additional outputs like pooler_output
         if len(self.model.outputs) > 1:
             for idx, output in enumerate(self.model.outputs[1:], start=1):
                 output_name = output.get_any_name()
-                if "pooler_output" in output_name or "last_hidden_state" in output_name:
+                if "pooler_output" in output_name:
                     model_outputs[output_name] = torch.from_numpy(ov_outputs[idx])
 
         if return_dict:
@@ -1320,6 +1371,8 @@ class OVModelTransformer(OVPipelinePart):
         timestep: torch.LongTensor = None,
         img_ids: torch.Tensor = None,
         txt_ids: torch.Tensor = None,
+        siglip_feats: torch.Tensor = None,
+        image_noise_mask: torch.Tensor = None,
         guidance: torch.Tensor = None,
         block_controlnet_hidden_states: List = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
@@ -1350,6 +1403,10 @@ class OVModelTransformer(OVPipelinePart):
             "encoder_hidden_states": encoder_hidden_states,
         }
 
+        if siglip_feats is not None:
+            model_inputs["siglip_feats"] = siglip_feats
+        if image_noise_mask is not None:
+            model_inputs["image_noise_mask"] = image_noise_mask
         if pooled_projections is not None:
             model_inputs["pooled_projections"] = pooled_projections
         if img_ids is not None:
@@ -1771,10 +1828,93 @@ class OVZImagePipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, ZImag
 
 class OVZImageOmniPipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, ZImageOmniPipeline):
     main_input_name = "prompt"
-    export_feature = "text-to-image"
+    export_feature = "image-to-image"
     auto_model_class = ZImageOmniPipeline
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
+    def prepare_image_latents(
+        self,
+        images: List[torch.Tensor],
+        batch_size,
+        device,
+        dtype,
+    ):
+        """Prepare image latents for OpenVINO VAE encoder.
+        
+        OpenVINO VAE returns ModelOutput with latent_dist attribute.
+        """
+        image_latents = []
+        for image in images:
+            image = image.to(device=device, dtype=dtype)
+            
+            # Use OpenVINO VAE encoder
+            vae_output = self.vae.encode(image)
+            
+            # Extract latent from ModelOutput
+            # vae_output has latent_dist attribute (DiagonalGaussianDistribution)
+            if hasattr(vae_output, 'latent_dist'):
+                image_latent = (vae_output.latent_dist.mode()[0] - self.vae.encoder.config.shift_factor) * self.vae.encoder.config.scaling_factor
+            elif hasattr(vae_output, 'latents'):
+                image_latent = (vae_output.latents - self.vae.encoder.config.shift_factor) * self.vae.encoder.config.scaling_factor
+            else:
+                # Fallback for any other format
+                if isinstance(vae_output, torch.Tensor):
+                    image_latent = (vae_output - self.vae.encoder.config.shift_factor) * self.vae.encoder.config.scaling_factor
+                else:
+                    raise ValueError(f"Unexpected VAE output format: {type(vae_output)}")
+            
+            image_latent = image_latent.unsqueeze(1).to(dtype)
+            image_latents.append(image_latent)
+
+        # Create copies for each batch
+        image_latents = [image_latents.copy() for _ in range(batch_size)]
+
+        return image_latents
+
+    # def prepare_siglip_embeds(
+    #     self,
+    #     images: List[torch.Tensor],
+    #     batch_size,
+    #     device,
+    #     dtype,
+    # ):
+    #     """Prepare siglip embeddings for OpenVINO siglip model."""
+    #     siglip_embeds = []
+    #     for image in images:
+    #         siglip_inputs = self.siglip_processor(images=[image], return_tensors="pt").to(device)
+    #         shape = siglip_inputs.spatial_shapes[0]
+            
+    #         # Call siglip model with unpacked dictionary
+    #         siglip_output = self.siglip(
+    #             pixel_values=siglip_inputs.get("pixel_values"),
+    #             spatial_shapes=siglip_inputs.get("spatial_shapes"),
+    #             pixel_attention_mask=siglip_inputs.get("pixel_attention_mask"),
+    #         )
+            
+    #         # Extract last_hidden_state from ModelOutput
+    #         if hasattr(siglip_output, 'last_hidden_state'):
+    #             hidden_state = siglip_output.last_hidden_state
+    #         else:
+    #             # The first output is typically the embeddings
+    #             # Get the first key value from the ModelOutput
+    #             for key, value in siglip_output.items():
+    #                 if "embedding" in key.lower() or "hidden" in key.lower():
+    #                     hidden_state = value
+    #                     break
+    #             else:
+    #                 # Fallback: get the first output
+    #                 hidden_state = next(iter(siglip_output.values()))
+            
+    #         B, N, C = hidden_state.shape
+    #         hidden_state = hidden_state[:, : shape[0] * shape[1]]
+    #         hidden_state = hidden_state.view(shape[0], shape[1], C)
+    #         siglip_embeds.append(hidden_state.to(dtype))
+
+    #     # Create copies for each batch
+    #     siglip_embeds = [siglip_embeds.copy() for _ in range(batch_size)]
+
+    #     return siglip_embeds
 
 
 SUPPORTED_OV_PIPELINES = [

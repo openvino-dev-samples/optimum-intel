@@ -2239,17 +2239,57 @@ class DcaeDecoderOpenVINOConfig(VaeDecoderOnnxConfig):
         }
 
 
+class DummySiglip2VisionInputGenerator(DummyVisionInputGenerator):
+    """Dummy input generator for Siglip2VisionModel."""
+    SUPPORTED_INPUT_NAMES = ("pixel_values", "pixel_attention_mask", "spatial_shapes")
+
+    def __init__(
+        self,
+        task: str,
+        normalized_config: NormalizedVisionConfig,
+        batch_size: int = DEFAULT_DUMMY_SHAPES["batch_size"],
+        num_channels: int = DEFAULT_DUMMY_SHAPES["num_channels"],
+        **kwargs,
+    ):
+        super().__init__(task, normalized_config, batch_size, num_channels, **kwargs)
+        self.normalized_config = normalized_config
+        self.batch_size = 1
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        if input_name == "pixel_values":
+            # Generate random pixel values in shape (batch_size, max_num_patches, num_channels * patch_size * patch_size)
+            return self.random_float_tensor(
+                [self.batch_size, self.normalized_config.num_patches, self.num_channels*self.normalized_config.patch_size*self.normalized_config.patch_size],
+                framework=framework,
+                dtype=float_dtype,
+            )
+        elif input_name == "pixel_attention_mask":
+            # Generate attention mask in shape (batch_size, height, width)
+            # All 1s to indicate all pixels should be attended
+            import torch
+            return torch.ones([self.batch_size, self.normalized_config.num_patches], dtype=torch.int64)
+        elif input_name == "spatial_shapes":
+            # Generate spatial shapes in shape (batch_size, 2) - contains (height, width) for each image
+            import torch
+            return torch.full([self.batch_size, 2], fill_value=self.normalized_config.patch_size, dtype=torch.int64)
+        else:
+            return super().generate(input_name, framework, int_dtype, float_dtype)
+
+
 @register_in_tasks_manager("siglip2-vision", *["feature-extraction"], library_name="diffusers")
 class Siglip2VisionOpenVINOConfig(VisionOnnxConfig):
     """Export config for Siglip2VisionModel used in ZImageOmniPipeline."""
 
     NORMALIZED_CONFIG_CLASS = NormalizedVisionConfig
     DEFAULT_ONNX_OPSET = 14
+    DUMMY_INPUT_GENERATOR_CLASSES = (DummySiglip2VisionInputGenerator,)
 
     @property
     def inputs(self) -> Dict[str, Dict[int, str]]:
         return {
-            "pixel_values": {0: "batch_size", 2: "height", 3: "width"},
+            "pixel_values": {0: "batch_size"},
+            "pixel_attention_mask": {0: "batch_size"},
+            "spatial_shapes": {0: "batch_size"},
         }
 
     @property
@@ -4511,83 +4551,12 @@ class LFM2OpenVINOConfig(MambaOpenVINOConfig):
             self.add_past_key_values(common_inputs, direction="inputs")
         return common_inputs
 class DummyZImageTransformerInputGenerator(DummyInputGenerator):
-    SUPPORTED_INPUT_NAMES = (
-        "x",
-        "cap_feats",
-        "t",
-    )
-
-    def __init__(
-        self,
-        task: str,
-        normalized_config: NormalizedVisionConfig,
-        batch_size: int = DEFAULT_DUMMY_SHAPES["batch_size"],
-        num_channels: int = DEFAULT_DUMMY_SHAPES["num_channels"],
-        width: int = DEFAULT_DUMMY_SHAPES["width"] // 4,
-        height: int = DEFAULT_DUMMY_SHAPES["height"] // 4,
-        sequence_length: int = DEFAULT_DUMMY_SHAPES["sequence_length"],
-        **kwargs,
-    ):
-        self.normalized_config = normalized_config
-        self.batch_size = 1
-        self.sequence_length = sequence_length
-        self.num_channels = num_channels
-        self.width = width
-        self.height = height
-        if getattr(normalized_config, "in_channels", None):
-            self.num_channels = normalized_config.in_channels // 4
-        if getattr(normalized_config, "cap_feat_dim", None):
-            self.cap_feat_dim = normalized_config.cap_feat_dim
-
-    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
-        if input_name == "x":
-            shape = [self.batch_size, self.num_channels * 4, 1, self.height * 4, self.width * 4]
-            return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
-        if input_name == "cap_feats":
-            shape = [self.batch_size, self.sequence_length, self.cap_feat_dim]
-            return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
-        if input_name == "t":
-            return self.random_float_tensor([1], max_value=1, min_value=0, framework=framework, dtype=float_dtype)
-
-        return super().generate(input_name, framework, int_dtype, float_dtype)
-    
-@register_in_tasks_manager("z-image-transformer-2d", *["semantic-segmentation"], library_name="diffusers")
-class ZTransformerOpenVINOConfig(OnnxConfig):
-    NORMALIZED_CONFIG_CLASS = NormalizedVisionConfig
-
-    DUMMY_INPUT_GENERATOR_CLASSES = (
-        DummyZImageTransformerInputGenerator,
-    )
-
-    @property
-    def inputs(self):
-        common_inputs = {}
-        common_inputs["x"] = {0: "batch_size", 2: "num_frames", 3: "height", 4: "width"}
-        common_inputs["cap_feats"] =  {0: "batch_size", 1: "seq_len"}
-        common_inputs["t"] = {0: "batch_size"}
-        return common_inputs
-    
-    @property
-    def outputs(self):
-        common_outputs = {
-            "unified_results": {2: "height", 3: "width"},
-        }
-        return common_outputs
-    
-    def patch_model_for_export(
-        self, model: PreTrainedModel, model_kwargs: Optional[Dict[str, Any]] = None
-    ) -> ModelPatcher:
-        # OpenVINO can not handle complex data in this model
-        return ZImageTransformerModelPatcher(self, model, model_kwargs=model_kwargs)
-
-
-class DummyZImageOmniTransformerInputGenerator(DummyInputGenerator):
-    """Dummy input generator for ZImageOmniPipeline transformer (with condition images)."""
+    """Dummy input generator for ZImageTransformer and ZImageOmniTransformer models."""
     
     SUPPORTED_INPUT_NAMES = (
-        "x",
-        "cap_feats",
-        "t",
+        "hidden_states",
+        "encoder_hidden_states",
+        "timestep",
         "siglip_feats",
         "image_noise_mask",
     )
@@ -4617,21 +4586,14 @@ class DummyZImageOmniTransformerInputGenerator(DummyInputGenerator):
         self.siglip_hidden_dim = getattr(normalized_config, "siglip_hidden_dim", 1152)
 
     def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
-        if input_name == "x":
-            # For omni mode: will be converted to List[List[Tensor]] in patcher
-            # Stack condition and target images: [2, B, C, 1, H, W]
-            cond_shape = [self.batch_size, self.num_channels * 4, 1, self.height * 4, self.width * 4]
-            cond_img = self.random_float_tensor(cond_shape, framework=framework, dtype=float_dtype)
-            target_shape = [self.batch_size, self.num_channels * 4, 1, self.height * 4, self.width * 4]
-            target_img = self.random_float_tensor(target_shape, framework=framework, dtype=float_dtype)
-            # Stack along first dimension for export
-            import torch
-            return torch.stack([cond_img, target_img], dim=0)
-        if input_name == "cap_feats":
+        if input_name == "hidden_states":
+            shape = [self.batch_size, self.num_channels * 4, 1, self.height * 4, self.width * 4]
+            return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
+        if input_name == "encoder_hidden_states":
             # Text embeddings: [B, seq_len, dim]
             shape = [self.batch_size, self.sequence_length, self.cap_feat_dim]
             return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
-        if input_name == "t":
+        if input_name == "timestep":
             return self.random_float_tensor([self.batch_size], max_value=1, min_value=0, framework=framework, dtype=float_dtype)
         if input_name == "siglip_feats":
             # For omni mode: will be converted to List[List[Tensor]] in patcher
@@ -4649,6 +4611,36 @@ class DummyZImageOmniTransformerInputGenerator(DummyInputGenerator):
 
         return super().generate(input_name, framework, int_dtype, float_dtype)
 
+    
+@register_in_tasks_manager("z-image-transformer-2d", *["semantic-segmentation"], library_name="diffusers")
+class ZTransformerOpenVINOConfig(OnnxConfig):
+    NORMALIZED_CONFIG_CLASS = NormalizedVisionConfig
+
+    DUMMY_INPUT_GENERATOR_CLASSES = (
+        DummyZImageTransformerInputGenerator,
+    )
+
+    @property
+    def inputs(self):
+        common_inputs = {}
+        common_inputs["hidden_states"] = {0: "batch_size", 2: "num_frames", 3: "height", 4: "width"}
+        common_inputs["encoder_hidden_states"] =  {0: "batch_size", 1: "seq_len"}
+        common_inputs["timestep"] = {0: "batch_size"}
+        return common_inputs
+    
+    @property
+    def outputs(self):
+        common_outputs = {
+            "unified_results": {2: "height", 3: "width"},
+        }
+        return common_outputs
+    
+    def patch_model_for_export(
+        self, model: PreTrainedModel, model_kwargs: Optional[Dict[str, Any]] = None
+    ) -> ModelPatcher:
+        # OpenVINO can not handle complex data in this model
+        return ZImageTransformerModelPatcher(self, model, model_kwargs=model_kwargs)
+
 
 @register_in_tasks_manager("z-image-omni-transformer-2d", *["semantic-segmentation"], library_name="diffusers")
 class ZOmniTransformerOpenVINOConfig(OnnxConfig):
@@ -4657,19 +4649,19 @@ class ZOmniTransformerOpenVINOConfig(OnnxConfig):
     NORMALIZED_CONFIG_CLASS = NormalizedVisionConfig
 
     DUMMY_INPUT_GENERATOR_CLASSES = (
-        DummyZImageOmniTransformerInputGenerator,
+        DummyZImageTransformerInputGenerator,
     )
 
     @property
     def inputs(self):
         common_inputs = {}
-        # x: List[List[Tensor]] with [[cond_img, target_img], ...]
+        # hidden_states: List[List[Tensor]] with [[cond_img, target_img], ...]
         # For export, we flatten to separate inputs for condition and target
-        common_inputs["x"] = {0: "batch_size", 2: "num_frames", 3: "height", 4: "width"}
+        common_inputs["hidden_states"] = {0: "batch_size", 2: "num_frames", 3: "height", 4: "width"}
         # Text embeddings
-        common_inputs["cap_feats"] = {0: "batch_size", 1: "seq_len"}
+        common_inputs["encoder_hidden_states"] = {0: "batch_size", 1: "seq_len"}
         # Timestep
-        common_inputs["t"] = {0: "batch_size"}
+        common_inputs["timestep"] = {0: "batch_size"}
         # siglip_feats: List[List[Tensor]] with [[siglip, None], ...]
         common_inputs["siglip_feats"] = {0: "batch_size", 1: "siglip_h", 2: "siglip_w"}
         # image_noise_mask: noise mask for condition/target images

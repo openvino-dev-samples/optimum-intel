@@ -4642,12 +4642,12 @@ class ZTransformerOpenVINOConfig(OnnxConfig):
     @property
     def inputs(self):
         common_inputs = {}
-        # x: Tensor [num_images, batch, C, 1, H, W]
-        common_inputs["x"] = {1: "batch_size", 4: "height", 5: "width"}
-        # cap_feats: Tensor [num_caps, batch, max_seq_len, dim]
-        common_inputs["cap_feats"] = {1: "batch_size", 2: "seq_len"}
-        # t: Tensor [batch_size]
-        common_inputs["t"] = {0: "batch_size"}
+        # hidden_states: Tensor [num_images, batch, C, 1, H, W]
+        common_inputs["hidden_states"] = {1: "batch_size", 4: "height", 5: "width"}
+        # encoder_hidden_states: Tensor [num_caps, batch, max_seq_len, dim]
+        common_inputs["encoder_hidden_states"] = {1: "batch_size", 2: "seq_len"}
+        # timestep: Tensor [batch_size]
+        common_inputs["timestep"] = {0: "batch_size"}
         return common_inputs
     
     @property
@@ -4678,11 +4678,11 @@ class ZOmniTransformerOpenVINOConfig(OnnxConfig):
     def inputs(self):
         common_inputs = {}
         # x: Tensor [num_images, batch, C, 1, H, W]
-        common_inputs["x"] = {1: "batch_size", 4: "height", 5: "width"}
+        common_inputs["hidden_states"] = {1: "batch_size", 4: "height", 5: "width"}
         # cap_feats: Tensor [num_caps, batch, max_seq_len, dim]
-        common_inputs["cap_feats"] = {1: "batch_size", 2: "seq_len"}
+        common_inputs["encoder_hidden_states"] = {1: "batch_size", 2: "seq_len"}
         # t: Tensor [batch_size]
-        common_inputs["t"] = {0: "batch_size"}
+        common_inputs["timestep"] = {0: "batch_size"}
         # siglip_feats: Tensor [batch, H, W, C]
         common_inputs["siglip_feats"] = {0: "batch_size", 1: "siglip_h", 2: "siglip_w"}
         # image_noise_mask: Tensor [batch, num_images]

@@ -4038,6 +4038,9 @@ class ZImageTransformerModelPatcher(ModelPatcher):
         for layer in self._model.layers:
             layer.attention._orig_processor = layer.attention.processor
             layer.attention.processor = PatchedZSingleStreamAttnProcessor()
+        for layer in self._model.siglip_refiner:
+            layer.attention._orig_processor = layer.attention.processor
+            layer.attention.processor = PatchedZSingleStreamAttnProcessor()
 
         self._orig_forward = self._model.forward
         self._orig_patchify_and_embed = self._model.patchify_and_embed
@@ -4082,8 +4085,8 @@ class ZImageTransformerModelPatcher(ModelPatcher):
         
         for layer in self._model.layers:
             layer.attention.processor = layer.attention._orig_processor
-
-
+        for layer in self._model.siglip_refiner:
+            layer.attention.processor = layer.attention._orig_processor
 
 
 def _minicpmv_resampler_forward(self, image_feature, pos_embed, key_padding_mask):

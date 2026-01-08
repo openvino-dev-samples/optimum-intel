@@ -1463,6 +1463,10 @@ class OVModelTransformer(OVPipelinePart):
             # Convert to Tensor [batch, num_images]
             if isinstance(image_noise_mask[0], list):
                 image_noise_mask = torch.tensor(image_noise_mask, dtype=torch.long)
+                
+        print(f"shape of hidden_states: {x.shape if x is not None else 'None'}")
+        print(f"shape of x: {x.shape if x is not None else 'None'}")
+        print(f"shape of encoder_hidden_states: {cap_feats.shape if cap_feats is not None else 'None'}")
         
         model_inputs = {
             "hidden_states": hidden_states if hidden_states is not None else x,
@@ -1915,6 +1919,10 @@ class OVZImageOmniPipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, Z
         for image in images:
             image = image.to(device=device, dtype=dtype)
             
+            # Add batch dimension if missing so vae.encode gets (B, C, H, W)
+            if image.ndim == 3:
+                image = image.unsqueeze(0)
+            
             # Use OpenVINO VAE encoder
             vae_output = self.vae.encode(image)
             
@@ -1930,6 +1938,12 @@ class OVZImageOmniPipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, Z
                     image_latent = (vae_output - self.vae.encoder.config.shift_factor) * self.vae.encoder.config.scaling_factor
                 else:
                     raise ValueError(f"Unexpected VAE output format: {type(vae_output)}")
+            
+            # Squeeze batch dimension if it was added, then unsqueeze(1) to match original format
+            # Original format: [C, H, W] -> unsqueeze(1) -> [1, C, H, W]
+            # After VAE: [batch, C, H, W] -> squeeze(0) -> [C, H, W] -> unsqueeze(1) -> [1, C, H, W]
+            if image_latent.ndim == 4 and image_latent.shape[0] == 1:
+                image_latent = image_latent.squeeze(0)
             
             image_latent = image_latent.unsqueeze(1).to(dtype)
             image_latents.append(image_latent)

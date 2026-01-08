@@ -3515,48 +3515,77 @@ def _zimage_forward(
     Patched forward for ZImage transformer matching original model signature.
     
     Args:
-        hidden_states: Union[List[torch.Tensor], List[List[torch.Tensor]], torch.Tensor]
-            - Text-to-image: List of image tensors [C, 1, H, W]
-            - Omni: List of lists [[cond_img, target_img], ...]
-            - Export (omni): Stacked tensor [2, B, C, 1, H, W] that will be converted to list format
+        hidden_states: Union[torch.Tensor, List[torch.Tensor], List[List[torch.Tensor]]]
+            - Export: Tensor [num_images, batch, C, 1, H, W] (will be converted)
+            - Runtime text-to-image: List of tensors [C, 1, H, W]
+            - Runtime omni: List of lists [[cond_img, target_img], ...]
         timestep: Timestep tensor [B]
-        encoder_hidden_states: Union[List[torch.Tensor], List[List[torch.Tensor]]]
-            - Text-to-image: List of caption features [seq_len, dim]
-            - Omni: List of lists [[cap, cap], ...]
+        encoder_hidden_states: Union[torch.Tensor, List[torch.Tensor], List[List[torch.Tensor]]]
+            - Export: Tensor [num_caps, batch, max_seq_len, dim] (will be converted)
+            - Runtime text-to-image: List of tensors [seq_len, dim]
+            - Runtime omni: List of lists [[cap1, cap2, cap3], ...]
         return_dict: Whether to return dict (ignored, always returns tensor)
         controlnet_block_samples: Optional controlnet features (not used in export)
-        siglip_feats: Optional[Union[List[List[torch.Tensor]], torch.Tensor]]
-            - Omni mode only: List of lists [[siglip, None], ...]
-            - Export (omni): Tensor [B, H, W, C] that will be converted to list format
-        image_noise_mask: Optional[List[List[int]]]
-            - Omni mode only: List of lists [[0, 1], ...] marking clean/noisy images
+        siglip_feats: Optional[Union[torch.Tensor, List[List[Optional[torch.Tensor]]]]]
+            - Export: Tensor [batch, H, W, C] (will be converted)
+            - Runtime omni: List of lists [[(H, W, C), None], ...]
+        image_noise_mask: Optional[Union[torch.Tensor, List[List[int]]]]
+            - Export: Tensor [batch, num_images] (will be converted)
+            - Runtime omni: List of lists [[0, 1], ...]
         patch_size: Patch size (default: 2)
         f_patch_size: Frame patch size (default: 1)
     """
-    # Convert tensor inputs to list format for omni mode (from export)
-    if isinstance(hidden_states, torch.Tensor) and hidden_states.ndim == 6 and hidden_states.shape[0] == 2:
-        # hidden_states is [2, B, C, 1, H, W] from export, convert to [[cond, target]]
-        hidden_states = [list(torch.unbind(hidden_states, dim=0))]
+    # Convert tensor inputs to list format for model processing
+    if isinstance(hidden_states, torch.Tensor) and hidden_states.ndim == 6:
+        # hidden_states is [num_images, batch, C, 1, H, W] from export
+        # Convert to [[img1_b1, img2_b1], [img1_b2, img2_b2], ...]
+        num_images, batch_size = hidden_states.shape[0], hidden_states.shape[1]
+        hidden_states = [[hidden_states[i, b] for i in range(num_images)] for b in range(batch_size)]
         omni_mode = True
-    else:
-        # Check if omni mode from list structure
+    elif isinstance(hidden_states, list) and len(hidden_states) > 0:
         omni_mode = isinstance(hidden_states[0], list)
+    else:
+        omni_mode = False
+    
+    # Convert encoder_hidden_states tensor to list format
+    if isinstance(encoder_hidden_states, torch.Tensor) and encoder_hidden_states.ndim == 4:
+        # encoder_hidden_states is [num_caps, batch, max_seq_len, dim]
+        # Convert to [[cap1, cap2, cap3], ...] removing padding
+        num_caps, batch_size = encoder_hidden_states.shape[0], encoder_hidden_states.shape[1]
+        cap_feats_list = []
+        for b in range(batch_size):
+            batch_caps = []
+            for c in range(num_caps):
+                # Remove zero-padding by finding first all-zero row
+                cap_tensor = encoder_hidden_states[c, b]  # [max_seq_len, dim]
+                # Simple heuristic: keep non-zero rows
+                non_zero_mask = cap_tensor.abs().sum(dim=1) > 0
+                if non_zero_mask.any():
+                    valid_cap = cap_tensor[non_zero_mask]
+                    batch_caps.append(valid_cap)
+            cap_feats_list.append(batch_caps)
+        encoder_hidden_states = cap_feats_list
     
     # Convert siglip_feats tensor to list format for omni mode
     if omni_mode and siglip_feats is not None and isinstance(siglip_feats, torch.Tensor):
-        # siglip_feats is [B, H, W, C] from export
-        # Convert to [[siglip, None]] - only condition image has siglip features
-        siglip_feats = [[siglip_feats, None]]
+        # siglip_feats is [batch, H, W, C]
+        # Convert to [[(H, W, C), None], ...] - only condition image has siglip
+        batch_size = siglip_feats.shape[0]
+        siglip_feats = [[siglip_feats[b], None] for b in range(batch_size)]
     
-    # Convert image_noise_mask tensor to list format for omni mode
+    # Convert image_noise_mask tensor to list format
     if omni_mode and image_noise_mask is not None and isinstance(image_noise_mask, torch.Tensor):
-        # image_noise_mask is [B, num_images] from export, convert to [[mask1], [mask2], ...]
-        image_noise_mask = [list(torch.unbind(image_noise_mask, dim=0))]
+        # image_noise_mask is [batch, num_images]
+        # Convert to [[mask1, mask2], ...]
+        image_noise_mask = image_noise_mask.tolist()
+    
+    # Now proceed with list-based processing
+    omni_mode = isinstance(hidden_states[0], list)
     
     assert patch_size in self.all_patch_size
     assert f_patch_size in self.all_f_patch_size
     
-    device = x[0][-1].device if omni_mode else x[0].device
+    device = hidden_states[0][-1].device if omni_mode else hidden_states[0].device
     
     if omni_mode:
         # Timestep embeddings: dual for omni mode
@@ -3566,9 +3595,9 @@ def _zimage_forward(
         
         # Patchify and embed
         (
-            x,
-            cap_feats,
-            siglip_feats,
+            x_out,
+            cap_feats_out,
+            siglip_feats_out,
             x_size,
             x_pos_ids,
             cap_pos_ids,
@@ -3590,8 +3619,8 @@ def _zimage_forward(
         t_noisy = t_clean = None
         
         (
-            x,
-            cap_feats,
+            x_out,
+            cap_feats_out,
             x_size,
             x_pos_ids,
             cap_pos_ids,
@@ -3600,36 +3629,36 @@ def _zimage_forward(
         ) = self.patchify_and_embed(hidden_states, encoder_hidden_states, patch_size, f_patch_size)
         
         x_pos_offsets = x_noise_mask = cap_noise_mask = siglip_noise_mask = None
-        siglip_feats = siglip_pos_ids = siglip_pad_mask = None
+        siglip_feats_out = siglip_pos_ids = siglip_pad_mask = None
 
     # X embed & refine
-    x_seqlens = [xi.shape[0] for xi in x]
-    x = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](torch.cat(x, dim=0))
-    x, x_freqs, x_mask, _, x_noise_tensor = self._prepare_sequence(
-        list(x.split(x_seqlens, dim=0)), x_pos_ids, x_pad_mask, self.x_pad_token, x_noise_mask, device
+    x_seqlens = [xi.shape[0] for xi in x_out]
+    x_embedded = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](torch.cat(x_out, dim=0))
+    x_embedded, x_freqs, x_mask, _, x_noise_tensor = self._prepare_sequence(
+        list(x_embedded.split(x_seqlens, dim=0)), x_pos_ids, x_pad_mask, self.x_pad_token, x_noise_mask, device
     )
     
     for layer in self.noise_refiner:
-        x = layer(x, x_mask, x_freqs, adaln_input, x_noise_tensor, t_noisy, t_clean)
+        x_embedded = layer(x_embedded, x_mask, x_freqs, adaln_input, x_noise_tensor, t_noisy, t_clean)
     
     # Cap embed & refine
-    cap_seqlens = [ci.shape[0] for ci in cap_feats]
-    cap_feats = self.cap_embedder(torch.cat(cap_feats, dim=0))
-    cap_feats, cap_freqs, cap_mask, _, _ = self._prepare_sequence(
-        list(cap_feats.split(cap_seqlens, dim=0)), cap_pos_ids, cap_pad_mask, self.cap_pad_token, None, device
+    cap_seqlens = [ci.shape[0] for ci in cap_feats_out]
+    cap_embedded = self.cap_embedder(torch.cat(cap_feats_out, dim=0))
+    cap_embedded, cap_freqs, cap_mask, _, _ = self._prepare_sequence(
+        list(cap_embedded.split(cap_seqlens, dim=0)), cap_pos_ids, cap_pad_mask, self.cap_pad_token, None, device
     )
     
     for layer in self.context_refiner:
-        cap_feats = layer(cap_feats, cap_mask, cap_freqs)
+        cap_embedded = layer(cap_embedded, cap_mask, cap_freqs)
     
     # Siglip embed & refine (omni mode only)
     siglip_seqlens = None
     siglip_freqs = None
-    if omni_mode and siglip_feats[0] is not None and self.siglip_embedder is not None:
-        siglip_seqlens = [si.shape[0] for si in siglip_feats]
-        siglip_feats = self.siglip_embedder(torch.cat(siglip_feats, dim=0))
-        siglip_feats, siglip_freqs, siglip_mask, _, _ = self._prepare_sequence(
-            list(siglip_feats.split(siglip_seqlens, dim=0)),
+    if omni_mode and siglip_feats_out[0] is not None and self.siglip_embedder is not None:
+        siglip_seqlens = [si.shape[0] for si in siglip_feats_out]
+        siglip_embedded = self.siglip_embedder(torch.cat(siglip_feats_out, dim=0))
+        siglip_embedded, siglip_freqs, siglip_mask, _, _ = self._prepare_sequence(
+            list(siglip_embedded.split(siglip_seqlens, dim=0)),
             siglip_pos_ids,
             siglip_pad_mask,
             self.siglip_pad_token,
@@ -3638,13 +3667,15 @@ def _zimage_forward(
         )
         
         for layer in self.siglip_refiner:
-            siglip_feats = layer(siglip_feats, siglip_mask, siglip_freqs)
+            siglip_embedded = layer(siglip_embedded, siglip_mask, siglip_freqs)
+    else:
+        siglip_embedded = None
     
     # Build unified sequence
     unified, unified_freqs, unified_mask, unified_noise_tensor = self._build_unified_sequence(
-        x, x_freqs, x_seqlens, x_noise_mask,
-        cap_feats, cap_freqs, cap_seqlens, cap_noise_mask,
-        siglip_feats, siglip_freqs, siglip_seqlens, siglip_noise_mask,
+        x_embedded, x_freqs, x_seqlens, x_noise_mask,
+        cap_embedded, cap_freqs, cap_seqlens, cap_noise_mask,
+        siglip_embedded, siglip_freqs, siglip_seqlens, siglip_noise_mask,
         omni_mode,
         device,
     )
@@ -3662,13 +3693,13 @@ def _zimage_forward(
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](unified, c=adaln_input)
     
     # Unpatchify
-    x_out = self.unpatchify(list(unified.unbind(dim=0)), x_size, patch_size, f_patch_size, x_pos_offsets)
+    result = self.unpatchify(list(unified.unbind(dim=0)), x_size, patch_size, f_patch_size, x_pos_offsets)
     
-    # Return single tensor
+    # Return stacked tensor for omni mode, single tensor otherwise
     if omni_mode:
-        return torch.stack(x_out, dim=0)
+        return torch.stack(result, dim=0)
     else:
-        return x_out[0]
+        return result[0]
 
 
 def _zimage_rope_embedder_precompute_freqs_cis(dim: List[int], end: List[int], theta: float = 256.0):

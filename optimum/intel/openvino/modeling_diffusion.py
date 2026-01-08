@@ -1365,10 +1365,13 @@ class OVModelUnet(OVPipelinePart):
 class OVModelTransformer(OVPipelinePart):
     def forward(
         self,
-        hidden_states: torch.FloatTensor,
+        hidden_states: torch.FloatTensor = None,
+        x: torch.FloatTensor = None,
         encoder_hidden_states: torch.FloatTensor = None,
+        cap_feats: torch.FloatTensor = None,
         pooled_projections: torch.FloatTensor = None,
         timestep: torch.LongTensor = None,
+        t: torch.LongTensor = None,
         img_ids: torch.Tensor = None,
         txt_ids: torch.Tensor = None,
         siglip_feats: torch.Tensor = None,
@@ -1391,16 +1394,80 @@ class OVModelTransformer(OVPipelinePart):
         if isinstance(hidden_states, list):
             hidden_states = torch.stack(hidden_states)
             return_dict = False
+            
+        if isinstance(cap_feats, list):
+            # cap_feats: List[List[Tensor]] with shape [[(seq1, dim), (seq2, dim), ...], ...]
+            # Convert to Tensor [num_caps, batch, max_seq_len, dim]
+            if isinstance(cap_feats[0], list):
+                # Omni mode: nested list
+                batch_size = len(cap_feats)
+                num_caps = len(cap_feats[0])
+                # Find max sequence length across all caps
+                max_seq_len = max(cap.shape[0] for batch_caps in cap_feats for cap in batch_caps)
+                cap_feat_dim = cap_feats[0][0].shape[-1]
+                
+                # Create padded tensor
+                cap_feats_tensor = torch.zeros(num_caps, batch_size, max_seq_len, cap_feat_dim, dtype=cap_feats[0][0].dtype)
+                for b_idx, batch_caps in enumerate(cap_feats):
+                    for c_idx, cap in enumerate(batch_caps):
+                        seq_len = cap.shape[0]
+                        cap_feats_tensor[c_idx, b_idx, :seq_len, :] = cap
+                cap_feats = cap_feats_tensor
+            else:
+                # Simple list mode: just stack
+                cap_feats = torch.stack(cap_feats)
+            return_dict = False
+        
+        if isinstance(x, list):
+            # x: List[List[Tensor]] with shape [[(C, 1, H, W), (C, 1, H, W)], ...]
+            # Convert to Tensor [num_images, batch, C, 1, H, W]
+            if isinstance(x[0], list):
+                # Omni mode: nested list
+                batch_size = len(x)
+                num_images = len(x[0])
+                # Stack all images
+                x_tensor = torch.stack([torch.stack(batch_imgs) for batch_imgs in x], dim=1)  # [num_images, batch, C, 1, H, W]
+                x = x_tensor
+            else:
+                # Simple list mode: just stack
+                x = torch.stack(x)
+            return_dict = False
         
         if isinstance(pooled_projections, list):
             timestep = encoder_hidden_states
             encoder_hidden_states = torch.stack(pooled_projections)
             pooled_projections = None
         
+        # Convert siglip_feats from list to tensor if needed
+        if siglip_feats is not None and isinstance(siglip_feats, list):
+            # siglip_feats: List[List[Optional[Tensor]]] with [[(H, W, C), None], ...]
+            # Convert to Tensor [batch, H, W, C] - only take first element (condition image)
+            if isinstance(siglip_feats[0], list):
+                # Omni mode: extract first element from each batch
+                siglip_list = []
+                for batch_siglip in siglip_feats:
+                    if batch_siglip[0] is not None:
+                        siglip_list.append(batch_siglip[0])
+                    else:
+                        # Create zero tensor if None
+                        if len(siglip_list) > 0:
+                            siglip_list.append(torch.zeros_like(siglip_list[0]))
+                        else:
+                            # Fallback: create dummy tensor
+                            siglip_list.append(torch.zeros(16, 16, 1152))
+                siglip_feats = torch.stack(siglip_list)
+        
+        # Convert image_noise_mask from list to tensor if needed
+        if image_noise_mask is not None and isinstance(image_noise_mask, list):
+            # image_noise_mask: List[List[int]] with [[0, 1], [0, 1], ...]
+            # Convert to Tensor [batch, num_images]
+            if isinstance(image_noise_mask[0], list):
+                image_noise_mask = torch.tensor(image_noise_mask, dtype=torch.long)
+        
         model_inputs = {
-            "hidden_states": hidden_states,
-            "timestep": timestep,
-            "encoder_hidden_states": encoder_hidden_states,
+            "hidden_states": hidden_states if hidden_states is not None else x,
+            "timestep": timestep if timestep is not None else t,
+            "encoder_hidden_states": encoder_hidden_states if encoder_hidden_states is not None else cap_feats,
         }
 
         if siglip_feats is not None:

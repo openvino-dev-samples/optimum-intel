@@ -4551,7 +4551,15 @@ class LFM2OpenVINOConfig(MambaOpenVINOConfig):
             self.add_past_key_values(common_inputs, direction="inputs")
         return common_inputs
 class DummyZImageTransformerInputGenerator(DummyInputGenerator):
-    """Dummy input generator for ZImageTransformer and ZImageOmniTransformer models."""
+    """Dummy input generator for ZImageTransformer and ZImageOmniTransformer models.
+    
+    Returns tensor inputs for OpenVINO export (will be converted to list format in patcher):
+    - x: Tensor [num_images, batch, C, 1, H, W] - stacked condition and target images
+    - cap_feats: Tensor [num_caps, batch, max_seq_len, dim] - padded caption embeddings
+    - t: Tensor [batch_size]
+    - siglip_feats: Tensor [batch, H, W, C] - siglip features (only for condition image)
+    - image_noise_mask: Tensor [batch, num_images] - noise mask
+    """
     
     SUPPORTED_INPUT_NAMES = (
         "hidden_states",
@@ -4573,41 +4581,52 @@ class DummyZImageTransformerInputGenerator(DummyInputGenerator):
         **kwargs,
     ):
         self.normalized_config = normalized_config
-        self.batch_size = 1
+        # batch_size=2 for CFG mode (positive + negative)
+        self.batch_size = 2
         self.sequence_length = sequence_length
         self.num_channels = num_channels
         self.width = width
         self.height = height
         if getattr(normalized_config, "in_channels", None):
-            self.num_channels = normalized_config.in_channels // 4
+            self.num_channels = normalized_config.in_channels
         if getattr(normalized_config, "cap_feat_dim", None):
             self.cap_feat_dim = normalized_config.cap_feat_dim
         # Siglip hidden dim (typically 1152 for Siglip2)
-        self.siglip_hidden_dim = getattr(normalized_config, "siglip_hidden_dim", 1152)
+        self.siglip_hidden_dim = getattr(normalized_config, "siglip_feat_dim", 1152)
 
     def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
         if input_name == "hidden_states":
-            shape = [self.batch_size, self.num_channels * 4, 1, self.height * 4, self.width * 4]
+            # hidden_states: Tensor [num_images, batch, C, 1, H, W]
+            # num_images=2 (condition + target), C=16, H=32, W=32
+            c = self.num_channels  # 16
+            h = self.height // 2   # latent height
+            w = self.width // 2    # latent width
+            shape = [2, self.batch_size, c, 1, h, w]
             return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
+        
         if input_name == "encoder_hidden_states":
-            # Text embeddings: [B, seq_len, dim]
-            shape = [self.batch_size, self.sequence_length, self.cap_feat_dim]
+            # encoder_hidden_states: Tensor [num_caps, batch, max_seq_len, dim]
+            # num_caps=3 (typical: cap_cond, cap_target, sep_token)
+            # Use max_seq_len=20 to accommodate variable lengths
+            shape = [3, self.batch_size, 20, self.cap_feat_dim]
             return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
+        
         if input_name == "timestep":
+            # Timestep: Tensor [batch_size]
             return self.random_float_tensor([self.batch_size], max_value=1, min_value=0, framework=framework, dtype=float_dtype)
+        
         if input_name == "siglip_feats":
-            # For omni mode: will be converted to List[List[Tensor]] in patcher
-            # Siglip features: [B, H_sig, W_sig, C_sig]
-            siglip_h = self.height * 4 // 14  # approximate siglip spatial size
-            siglip_w = self.width * 4 // 14
+            # siglip_feats: Tensor [batch, H, W, C]
+            siglip_h = 16
+            siglip_w = 16
             shape = [self.batch_size, siglip_h, siglip_w, self.siglip_hidden_dim]
-            # Return single tensor for export
             return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
+        
         if input_name == "image_noise_mask":
-            # Noise mask for omni mode: [[0, 1], ...] marking clean/noisy images
-            # 0 = clean (condition image), 1 = noisy (target image)
+            # image_noise_mask: Tensor [batch, num_images]
             import torch
-            return torch.tensor([[0, 1]], dtype=torch.long)
+            # [[0, 1], [0, 1]] for batch_size=2
+            return torch.tensor([[0, 1], [0, 1]], dtype=torch.long)
 
         return super().generate(input_name, framework, int_dtype, float_dtype)
 
@@ -4623,15 +4642,18 @@ class ZTransformerOpenVINOConfig(OnnxConfig):
     @property
     def inputs(self):
         common_inputs = {}
-        common_inputs["hidden_states"] = {0: "batch_size", 2: "num_frames", 3: "height", 4: "width"}
-        common_inputs["encoder_hidden_states"] =  {0: "batch_size", 1: "seq_len"}
-        common_inputs["timestep"] = {0: "batch_size"}
+        # x: Tensor [num_images, batch, C, 1, H, W]
+        common_inputs["x"] = {1: "batch_size", 4: "height", 5: "width"}
+        # cap_feats: Tensor [num_caps, batch, max_seq_len, dim]
+        common_inputs["cap_feats"] = {1: "batch_size", 2: "seq_len"}
+        # t: Tensor [batch_size]
+        common_inputs["t"] = {0: "batch_size"}
         return common_inputs
     
     @property
     def outputs(self):
         common_outputs = {
-            "unified_results": {2: "height", 3: "width"},
+            "sample": {0: "batch_size", 2: "height", 3: "width"},
         }
         return common_outputs
     
@@ -4655,16 +4677,15 @@ class ZOmniTransformerOpenVINOConfig(OnnxConfig):
     @property
     def inputs(self):
         common_inputs = {}
-        # hidden_states: List[List[Tensor]] with [[cond_img, target_img], ...]
-        # For export, we flatten to separate inputs for condition and target
-        common_inputs["hidden_states"] = {0: "batch_size", 2: "num_frames", 3: "height", 4: "width"}
-        # Text embeddings
-        common_inputs["encoder_hidden_states"] = {0: "batch_size", 1: "seq_len"}
-        # Timestep
-        common_inputs["timestep"] = {0: "batch_size"}
-        # siglip_feats: List[List[Tensor]] with [[siglip, None], ...]
+        # x: Tensor [num_images, batch, C, 1, H, W]
+        common_inputs["x"] = {1: "batch_size", 4: "height", 5: "width"}
+        # cap_feats: Tensor [num_caps, batch, max_seq_len, dim]
+        common_inputs["cap_feats"] = {1: "batch_size", 2: "seq_len"}
+        # t: Tensor [batch_size]
+        common_inputs["t"] = {0: "batch_size"}
+        # siglip_feats: Tensor [batch, H, W, C]
         common_inputs["siglip_feats"] = {0: "batch_size", 1: "siglip_h", 2: "siglip_w"}
-        # image_noise_mask: noise mask for condition/target images
+        # image_noise_mask: Tensor [batch, num_images]
         common_inputs["image_noise_mask"] = {0: "batch_size", 1: "num_images"}
         return common_inputs
     

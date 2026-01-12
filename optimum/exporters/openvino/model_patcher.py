@@ -3315,7 +3315,7 @@ class FluxTransfromerModelPatcher(ModelPatcher):
 
 def pad_sequence(sequences, batch_first=False, padding_value=0.0):
     """Pad a list of variable length Tensors with padding_value"""
-    max_len = max(seq.size(0) for seq in sequences)
+    max_len = torch.maximum(*[torch.tensor(seq.size(0)) for seq in sequences]).to(torch.int64)
     trailing_dims = sequences[0].shape[1:]
     
     if batch_first:

@@ -3528,6 +3528,9 @@ def _zimage_attn_processor_call(
 
     if attention_mask is not None and attention_mask.ndim == 2:
         attention_mask = attention_mask[:, None, None, :]
+        
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(torch.float32)
     
     hidden_states = dispatch_attention_fn(
         query,

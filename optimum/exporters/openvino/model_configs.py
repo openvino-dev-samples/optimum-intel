@@ -194,6 +194,11 @@ from .model_patcher import (
     Qwen2MoEPatcher,
     Qwen2VLLanguageModelPatcher,
     Qwen2VLVisionEmbMergerPatcher,
+    Qwen35MoeTextModelPatcher,
+    Qwen35MoeVLLanguageModelPatcher,
+    Qwen35TextModelPatcher,
+    Qwen35VLLanguageModelPatcher,
+    Qwen35VLVisionEmbMergerPatcher,
     Qwen3MoeModelPatcher,
     Qwen3VLLanguageModelPatcher,
     Qwen3VLVisionEmbMergerPatcher,
@@ -3902,6 +3907,146 @@ class Qwen3VLOpenVINOConfig(Qwen2VLOpenVINOConfig):
 
 
 @register_in_tasks_manager(
+    "qwen3_5",
+    *["image-text-to-text"],
+    library_name="transformers",
+)
+class Qwen35OpenVINOConfig(Qwen3VLOpenVINOConfig):
+    """VLM export config for Qwen3.5 (no deepstack features, uses GDN text backbone)."""
+
+    SUPPORTED_BEHAVIORS = [model_type.value for model_type in QwenVLConfigBehavior]
+    MIN_TRANSFORMERS_VERSION = "4.57.0"
+
+    def with_behavior(
+        self,
+        behavior: Union[str, QwenVLConfigBehavior],
+    ):
+        if isinstance(behavior, str) and not isinstance(behavior, QwenVLConfigBehavior):
+            behavior = QwenVLConfigBehavior(behavior)
+
+        if behavior == QwenVLConfigBehavior.TEXT_EMBEDDINGS:
+            return get_vlm_text_embeddings_config(
+                "qwen3_5_text", self._orig_config.text_config, self.int_dtype, self.float_dtype
+            )
+
+        if behavior == QwenVLConfigBehavior.LANGUAGE:
+            config = get_vlm_text_generation_config(
+                "qwen3_5_text",
+                self._orig_config.text_config,
+                self.int_dtype,
+                self.float_dtype,
+                model_patcher=Qwen35VLLanguageModelPatcher,
+                dummy_input_generator=DummyQwen2VLLMInputGenerator,
+                inputs_update={"position_ids": {1: "batch_size", 2: "sequence_length"}},
+            )
+            return config
+
+        if behavior in (
+            QwenVLConfigBehavior.VISION_EMBEDDINGS,
+            QwenVLConfigBehavior.VISION_EMBEDDINGS_MERGER,
+            QwenVLConfigBehavior.VISION_EMBEDDINGS_POS,
+        ):
+            return self.__class__(
+                self._orig_config,
+                task=self.task,
+                int_dtype=self.int_dtype,
+                float_dtype=self.float_dtype,
+                behavior=behavior,
+                preprocessors=self._preprocessors,
+            )
+
+    def patch_model_for_export(self, model: Union["PreTrainedModel"], model_kwargs: Optional[Dict[str, Any]] = None):
+        model_kwargs = model_kwargs or {}
+        if self._behavior == QwenVLConfigBehavior.VISION_EMBEDDINGS_MERGER:
+            return Qwen35VLVisionEmbMergerPatcher(self, model, model_kwargs)
+        if (
+            self._behavior == QwenVLConfigBehavior.VISION_EMBEDDINGS
+            or self._behavior == QwenVLConfigBehavior.VISION_EMBEDDINGS_POS
+        ):
+            return ModelPatcher(self, model, model_kwargs=model_kwargs)
+        return super().patch_model_for_export(model, model_kwargs)
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        if self._behavior == QwenVLConfigBehavior.VISION_EMBEDDINGS:
+            return super().outputs
+        if self._behavior == QwenVLConfigBehavior.VISION_EMBEDDINGS_MERGER:
+            return {"last_hidden_state": {0: "seq_len"}}
+        if self._behavior == QwenVLConfigBehavior.VISION_EMBEDDINGS_POS:
+            return {"last_hidden_state": {0: "seq_len", 1: "seq_len"}}
+        if self._behavior == QwenVLConfigBehavior.TEXT_EMBEDDINGS:
+            return {"inputs_embeds": {0: "batch_size", 1: "sequence_length"}}
+        if self._behavior == QwenVLConfigBehavior.LANGUAGE:
+            return get_vlm_internal_text_generation_config(
+                "qwen3_5_text", self._orig_config.text_config, self.int_dtype, self.float_dtype
+            ).outputs
+        raise Exception("Unknown Qwen3.5 behavior type.")
+
+
+@register_in_tasks_manager(
+    "qwen3_5_moe",
+    *["image-text-to-text"],
+    library_name="transformers",
+)
+class Qwen35MoeOpenVINOConfig(Qwen35OpenVINOConfig):
+    """VLM export config for Qwen3.5-MoE (MoE + GDN text backbone)."""
+
+    def with_behavior(
+        self,
+        behavior: Union[str, QwenVLConfigBehavior],
+    ):
+        if isinstance(behavior, str) and not isinstance(behavior, QwenVLConfigBehavior):
+            behavior = QwenVLConfigBehavior(behavior)
+
+        if behavior == QwenVLConfigBehavior.TEXT_EMBEDDINGS:
+            return get_vlm_text_embeddings_config(
+                "qwen3_5_moe_text", self._orig_config.text_config, self.int_dtype, self.float_dtype
+            )
+
+        if behavior == QwenVLConfigBehavior.LANGUAGE:
+            config = get_vlm_text_generation_config(
+                "qwen3_5_moe_text",
+                self._orig_config.text_config,
+                self.int_dtype,
+                self.float_dtype,
+                model_patcher=Qwen35MoeVLLanguageModelPatcher,
+                dummy_input_generator=DummyQwen2VLLMInputGenerator,
+                inputs_update={"position_ids": {1: "batch_size", 2: "sequence_length"}},
+            )
+            return config
+
+        if behavior in (
+            QwenVLConfigBehavior.VISION_EMBEDDINGS,
+            QwenVLConfigBehavior.VISION_EMBEDDINGS_MERGER,
+            QwenVLConfigBehavior.VISION_EMBEDDINGS_POS,
+        ):
+            return self.__class__(
+                self._orig_config,
+                task=self.task,
+                int_dtype=self.int_dtype,
+                float_dtype=self.float_dtype,
+                behavior=behavior,
+                preprocessors=self._preprocessors,
+            )
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        if self._behavior == QwenVLConfigBehavior.VISION_EMBEDDINGS:
+            return super().outputs
+        if self._behavior == QwenVLConfigBehavior.VISION_EMBEDDINGS_MERGER:
+            return {"last_hidden_state": {0: "seq_len"}}
+        if self._behavior == QwenVLConfigBehavior.VISION_EMBEDDINGS_POS:
+            return {"last_hidden_state": {0: "seq_len", 1: "seq_len"}}
+        if self._behavior == QwenVLConfigBehavior.TEXT_EMBEDDINGS:
+            return {"inputs_embeds": {0: "batch_size", 1: "sequence_length"}}
+        if self._behavior == QwenVLConfigBehavior.LANGUAGE:
+            return get_vlm_internal_text_generation_config(
+                "qwen3_5_moe_text", self._orig_config.text_config, self.int_dtype, self.float_dtype
+            ).outputs
+        raise Exception("Unknown Qwen3.5-MoE behavior type.")
+
+
+@register_in_tasks_manager(
     "glm",
     *[
         "feature-extraction",
@@ -5285,3 +5430,138 @@ class SiglipTextWithProjectionOpenVINOConfig(SiglipTextWithProjectionOnnxConfig)
 @register_in_tasks_manager("siglip-text", *["feature-extraction"])
 class SiglipTextOpenVINOConfig(SiglipTextOnnxConfig):
     pass
+
+
+class Qwen35DummyPastKeyValuesGenerator(DummyPastKeyValuesGenerator):
+    """
+    Generates dummy past_key_values inputs for Qwen3.5 / Qwen3.5-MoE hybrid architectures.
+    The cache layout is: [conv_0, recurrent_0, conv_1, recurrent_1, ..., key_0, value_0, key_1, value_1, ...]
+    where the first group covers linear_attention layers and the second covers full_attention layers.
+    """
+
+    SUPPORTED_INPUT_NAMES = ("cache_params",)
+
+    def __init__(
+        self,
+        task: str,
+        normalized_config,
+        batch_size: int = DEFAULT_DUMMY_SHAPES["batch_size"],
+        sequence_length: int = DEFAULT_DUMMY_SHAPES["sequence_length"],
+        **kwargs,
+    ):
+        super().__init__(
+            task=task,
+            normalized_config=normalized_config,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            **kwargs,
+        )
+        config = normalized_config.config
+        self.num_linear_layers = config.layer_types.count("linear_attention")
+        self.num_atten_layers = config.layer_types.count("full_attention")
+        self.batch_size = batch_size
+        self.normalized_config = normalized_config
+        self.hidden_size = self.normalized_config.hidden_size
+        self.linear_key_head_dim = config.linear_key_head_dim
+        self.linear_value_head_dim = config.linear_value_head_dim
+        self.linear_num_key_heads = config.linear_num_key_heads
+        self.linear_num_value_heads = config.linear_num_value_heads
+        self.linear_conv_kernel_dim = config.linear_conv_kernel_dim
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        past_key_values = []
+        key_dim = self.linear_key_head_dim * self.linear_num_key_heads
+        value_dim = self.linear_value_head_dim * self.linear_num_value_heads
+        conv_dim = key_dim * 2 + value_dim
+
+        for i in range(self.num_linear_layers):
+            # conv_state: [batch_size, conv_dim, conv_kernel_size]
+            conv_state_shape = (self.batch_size, conv_dim, self.linear_conv_kernel_dim)
+            conv_state = self.random_float_tensor(conv_state_shape, framework=framework, dtype=float_dtype)
+            past_key_values.append(conv_state)
+            # recurrent_state: [batch_size, num_v_heads, key_head_dim, value_head_dim]
+            recurrent_state_shape = (
+                self.batch_size,
+                self.linear_num_value_heads,
+                self.linear_key_head_dim,
+                self.linear_value_head_dim,
+            )
+            recurrent_state = self.random_float_tensor(recurrent_state_shape, framework=framework, dtype=float_dtype)
+            past_key_values.append(recurrent_state)
+
+        for i in range(self.num_atten_layers):
+            kv_shape = (
+                self.batch_size,
+                self.num_key_value_heads,
+                self.sequence_length,
+                self.hidden_size // self.num_attention_heads,
+            )
+            k = self.random_float_tensor(kv_shape, framework=framework, dtype=float_dtype)
+            v = self.random_float_tensor(kv_shape, framework=framework, dtype=float_dtype)
+            past_key_values.append(k)
+            past_key_values.append(v)
+
+        return past_key_values
+
+
+@register_in_tasks_manager(
+    "qwen3_5_text",
+    *[
+        "text-generation",
+        "text-generation-with-past",
+    ],
+    library_name="transformers",
+)
+class Qwen35TextOpenVINOConfig(MambaOpenVINOConfig):
+    PAD_ATTENTION_MASK_TO_PAST = False
+    DUMMY_INPUT_GENERATOR_CLASSES = (DummyTextInputGenerator, Qwen35DummyPastKeyValuesGenerator)
+    DUMMY_PKV_GENERATOR_CLASS = Qwen35DummyPastKeyValuesGenerator
+    NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
+    MIN_TRANSFORMERS_VERSION = "4.57.0"
+    _MODEL_PATCHER = Qwen35TextModelPatcher
+
+    def add_past_key_values(self, inputs_or_outputs: Dict[str, Dict[int, str]], direction: str):
+        if direction not in ["inputs", "outputs"]:
+            raise ValueError(f'direction must either be "inputs" or "outputs", but {direction} was given')
+
+        if direction == "inputs":
+            decoder_sequence_name = "past_sequence_length"
+            cache_name_prefix = "cache_params.past"
+        else:
+            decoder_sequence_name = "past_sequence_length + sequence_length"
+            cache_name_prefix = "cache_params.present"
+
+        self.num_linear_layers = self._normalized_config.layer_types.count("linear_attention")
+        self.num_atten_layers = self._normalized_config.layer_types.count("full_attention")
+
+        for i in range(self.num_linear_layers):
+            # conv_state: [batch_size, conv_dim, conv_kernel_size]
+            inputs_or_outputs[f"{cache_name_prefix}.conv.{i}"] = {0: "batch_size"}
+            # recurrent_state: [batch_size, num_v_heads, key_head_dim, value_head_dim]
+            inputs_or_outputs[f"{cache_name_prefix}.recurrent.{i}"] = {0: "batch_size"}
+
+        for i in range(self.num_atten_layers):
+            inputs_or_outputs[f"{cache_name_prefix}.key.{i}"] = {0: "batch_size", 2: decoder_sequence_name}
+            inputs_or_outputs[f"{cache_name_prefix}.value.{i}"] = {0: "batch_size", 2: decoder_sequence_name}
+
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        common_inputs = {
+            "input_ids": {0: "batch_size", 1: "sequence_length"},
+            "attention_mask": {0: "batch_size", 1: "sequence_length"},
+        }
+        if self.use_past_in_inputs:
+            self.add_past_key_values(common_inputs, direction="inputs")
+        return common_inputs
+
+
+@register_in_tasks_manager(
+    "qwen3_5_moe_text",
+    *[
+        "text-generation",
+        "text-generation-with-past",
+    ],
+    library_name="transformers",
+)
+class Qwen35MoeTextOpenVINOConfig(Qwen35TextOpenVINOConfig):
+    _MODEL_PATCHER = Qwen35MoeTextModelPatcher

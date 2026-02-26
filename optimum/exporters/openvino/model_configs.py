@@ -1724,6 +1724,19 @@ class LMInputEmbedsConfigHelper(TextDecoderWithPositionIdsOnnxConfig):
             dummy_inputs["token_type_ids"] = self.orig_export_config.DUMMY_INPUT_GENERATOR_CLASSES[
                 0
             ].random_int_tensor(token_type_ids_shape, min_value=0, max_value=2)
+
+        # Generate dummy inputs for any extra entries from input_info_upd (e.g., position_ids)
+        if self.input_info_upd:
+            dummy_inputs_generators = self.orig_export_config._create_dummy_input_generator_classes(**kwargs)
+            for input_name in self.input_info_upd:
+                if input_name not in dummy_inputs:
+                    for dummy_input_gen in dummy_inputs_generators:
+                        if dummy_input_gen.supports_input(input_name):
+                            dummy_inputs[input_name] = self.orig_export_config.overwrite_shape_and_generate_input(
+                                dummy_input_gen, input_name, framework, input_shapes=kwargs,
+                            )
+                            break
+
         return dummy_inputs
 
 
@@ -5510,6 +5523,8 @@ class Qwen35DummyPastKeyValuesGenerator(DummyPastKeyValuesGenerator):
         self.batch_size = batch_size
         self.normalized_config = normalized_config
         self.hidden_size = self.normalized_config.hidden_size
+        self.num_key_value_heads = self.normalized_config.num_key_value_heads
+        self.head_dim = getattr(config, "head_dim", self.hidden_size // self.normalized_config.num_attention_heads)
         self.linear_key_head_dim = config.linear_key_head_dim
         self.linear_value_head_dim = config.linear_value_head_dim
         self.linear_num_key_heads = config.linear_num_key_heads
@@ -5542,7 +5557,7 @@ class Qwen35DummyPastKeyValuesGenerator(DummyPastKeyValuesGenerator):
                 self.batch_size,
                 self.num_key_value_heads,
                 self.sequence_length,
-                self.hidden_size // self.num_attention_heads,
+                self.head_dim,
             )
             k = self.random_float_tensor(kv_shape, framework=framework, dtype=float_dtype)
             v = self.random_float_tensor(kv_shape, framework=framework, dtype=float_dtype)

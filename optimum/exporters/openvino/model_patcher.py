@@ -8590,12 +8590,12 @@ def patched_qwen3_5_moe_sparse_moe_block(self, hidden_states: torch.Tensor) -> t
     hidden_expanded = hidden_states_reshaped.unsqueeze(0).expand(num_experts, -1, -1)
 
     # Vectorized expert computation using pre-transposed weights
-    gate_up = torch.bmm(hidden_expanded, self._gate_up_projs_t)
+    gate_up = torch.bmm(hidden_expanded, self._gate_up_projs_t.to(hidden_expanded.dtype))
     intermediate_size = self.experts.intermediate_dim
     gate = gate_up[:, :, :intermediate_size]
     up = gate_up[:, :, intermediate_size:]
     activated = self.experts.act_fn(gate) * up
-    next_states = torch.bmm(activated, self._down_projs_t)
+    next_states = torch.bmm(activated, self._down_projs_t.to(activated.dtype))
 
     # Weight by routing and sum over experts
     next_states = next_states * new_routing_weights.T.unsqueeze(-1)
@@ -8914,6 +8914,26 @@ class Qwen35MoeTextModelPatcher(ModelPatcher):
                     patched_qwen3_5_moe_sparse_moe_block, sparse_moe_block
                 )
 
+    def post_make_16bit_traceable(self):
+        """Free duplicated expert weights after __make_16bit_traceable.
+
+        __make_16bit_traceable calls module.float() on Qwen3_5MoeExperts modules,
+        creating fp32 copies of gate_up_proj and down_proj parameters. Since patcher
+        already captured bf16 views (_gate_up_projs_t, _down_projs_t) for the patched
+        forward, the fp32 copies are unused waste. Free them to avoid OOM.
+        """
+        import gc
+
+        import torch
+        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeSparseMoeBlock
+
+        for decoder_layer in self._model.model.layers:
+            if isinstance(decoder_layer.mlp, Qwen3_5MoeSparseMoeBlock):
+                experts = decoder_layer.mlp.experts
+                experts.gate_up_proj.data = torch.empty(0)
+                experts.down_proj.data = torch.empty(0)
+        gc.collect()
+
     def __exit__(self, exc_type, exc_value, traceback):
         from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeSparseMoeBlock
 
@@ -9025,6 +9045,8 @@ class Qwen35VLLanguageModelPatcher(ModelPatcher):
                 layer_idx = self.linear_attn_mapping[self.last_linear_layer]
                 return self.conv_states[layer_idx] is not None
 
+        _lm_head_weight = model.lm_head.weight
+
         def patched_forward(
             inputs_embeds,
             attention_mask=None,
@@ -9063,7 +9085,7 @@ class Qwen35VLLanguageModelPatcher(ModelPatcher):
                 use_cache=use_cache,
             )
             hidden_states = outputs[0]
-            logits = model.lm_head(hidden_states)
+            logits = torch.nn.functional.linear(hidden_states, _lm_head_weight.to(hidden_states.dtype))
 
             result = {"logits": logits}
 
@@ -9178,6 +9200,8 @@ class Qwen35MoeVLLanguageModelPatcher(Qwen35VLLanguageModelPatcher):
                 layer_idx = self.linear_attn_mapping[self.last_linear_layer]
                 return self.conv_states[layer_idx] is not None
 
+        _lm_head_weight = model.lm_head.weight
+
         def patched_forward(
             inputs_embeds,
             attention_mask=None,
@@ -9216,7 +9240,7 @@ class Qwen35MoeVLLanguageModelPatcher(Qwen35VLLanguageModelPatcher):
                 use_cache=use_cache,
             )
             hidden_states = outputs[0]
-            logits = model.lm_head(hidden_states)
+            logits = torch.nn.functional.linear(hidden_states, _lm_head_weight.to(hidden_states.dtype))
 
             result = {"logits": logits}
 
@@ -9270,6 +9294,26 @@ class Qwen35MoeVLLanguageModelPatcher(Qwen35VLLanguageModelPatcher):
                 sparse_moe_block.forward = types.MethodType(
                     patched_qwen3_5_moe_sparse_moe_block, sparse_moe_block
                 )
+
+    def post_make_16bit_traceable(self):
+        """Free duplicated expert weights after __make_16bit_traceable.
+
+        __make_16bit_traceable calls module.float() on Qwen3_5MoeExperts modules,
+        creating fp32 copies of gate_up_proj and down_proj parameters. Since patcher
+        already captured bf16 views (_gate_up_projs_t, _down_projs_t) for the patched
+        forward, the fp32 copies are unused waste. Free them to avoid OOM.
+        """
+        import gc
+
+        import torch
+        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeSparseMoeBlock
+
+        for decoder_layer in self._model.model.language_model.layers:
+            if isinstance(decoder_layer.mlp, Qwen3_5MoeSparseMoeBlock):
+                experts = decoder_layer.mlp.experts
+                experts.gate_up_proj.data = torch.empty(0)
+                experts.down_proj.data = torch.empty(0)
+        gc.collect()
 
     def __exit__(self, exc_type, exc_value, traceback):
         from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeSparseMoeBlock

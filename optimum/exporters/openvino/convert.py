@@ -433,20 +433,39 @@ def export_pytorch(
                 if patch_16bit_model:
                     from openvino.frontend.pytorch.patch_model import __make_16bit_traceable
 
+                    import psutil
+                    proc = psutil.Process()
+                    print(f"[DEBUG] Before __make_16bit_traceable: RSS={proc.memory_info().rss / 1e9:.1f} GB", flush=True)
                     __make_16bit_traceable(model)
+                    print(f"[DEBUG] After __make_16bit_traceable: RSS={proc.memory_info().rss / 1e9:.1f} GB", flush=True)
 
+                # Allow patcher to free duplicated memory after 16-bit tracing setup.
+                # __make_16bit_traceable calls module.float() on non-Linear/Embedding modules,
+                # creating fp32 copies of parameters already captured as bf16 views by the patcher.
+                # This hook frees those fp32 duplicates to avoid OOM on large MoE models.
+                if hasattr(patcher, "post_make_16bit_traceable"):
+                    print(f"[DEBUG] Calling post_make_16bit_traceable hook", flush=True)
+                    patcher.post_make_16bit_traceable()
+                    print(f"[DEBUG] After post_make_16bit_traceable: RSS={proc.memory_info().rss / 1e9:.1f} GB", flush=True)
+                else:
+                    print(f"[DEBUG] No post_make_16bit_traceable hook found on patcher={type(patcher).__name__}", flush=True)
                 conversion_extensions = getattr(patcher, "conversion_extensions", [])
                 module_extensions = getattr(patcher, "module_extensions", None)
                 if module_extensions is not None:
                     ts_decoder_kwargs["module_extensions"] = module_extensions
 
-                ts_decoder = TorchScriptPythonDecoder(model, example_input=dummy_inputs, **ts_decoder_kwargs)
+                example_input = dummy_inputs
+
+                print(f"[DEBUG] Before TorchScriptPythonDecoder: RSS={proc.memory_info().rss / 1e9:.1f} GB" if 'proc' in dir() else "[DEBUG] Before TorchScriptPythonDecoder", flush=True)
+                ts_decoder = TorchScriptPythonDecoder(model, example_input=example_input, **ts_decoder_kwargs)
+                print(f"[DEBUG] After TorchScriptPythonDecoder: RSS={proc.memory_info().rss / 1e9:.1f} GB" if 'proc' in dir() else "[DEBUG] After TorchScriptPythonDecoder", flush=True)
                 ov_model = convert_model(
                     ts_decoder,
-                    example_input=dummy_inputs,
+                    example_input=example_input,
                     input=[(item.shape, item.type) for item in input_info],
                     extension=conversion_extensions,
                 )
+                print(f"[DEBUG] After convert_model: RSS={proc.memory_info().rss / 1e9:.1f} GB" if 'proc' in dir() else "[DEBUG] After convert_model", flush=True)
 
         ov_model.validate_nodes_and_infer_types()  # TODO: remove as unnecessary validation?
 

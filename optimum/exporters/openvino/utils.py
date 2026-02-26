@@ -91,9 +91,11 @@ def _get_input_info(
 ) -> List[InputInfo]:
     sig = inspect.signature(model.forward) if hasattr(model, "forward") else inspect.signature(model.call)
     inputs = config.ordered_inputs(model)
+
     ordered_dummy_inputs = {param: dummy_inputs[param] for param in sig.parameters if param in dummy_inputs}
     if not ordered_dummy_inputs:
         ordered_dummy_inputs = dummy_inputs
+
     ordered_input_names = list(inputs)
     flatten_inputs = flattenize_inputs(ordered_dummy_inputs.values())
     input_info = []

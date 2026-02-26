@@ -7905,7 +7905,6 @@ class LlamaEagle3ForCausalLM(LlamaPreTrainedModel, GenerationMixin):
 class RecurrentLinearAttention(torch.nn.Module):
     def __init__(self):
         super().__init__()
-
     def forward(
         self,
         query: torch.Tensor,
@@ -7921,7 +7920,6 @@ class RecurrentLinearAttention(torch.nn.Module):
             """This function is intended to align with the l2norm implementation in the FLA library."""
             inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
             return x * inv_norm
-
         q = query.transpose(1, 2).contiguous().to(torch.float32)
         k = key.transpose(1, 2).contiguous().to(torch.float32)
         v = value.transpose(1, 2).contiguous().to(torch.float32)
@@ -7945,18 +7943,18 @@ class RecurrentLinearAttention(torch.nn.Module):
             b_v = b_v - (h.clone() * b_k[..., None]).sum(-2)
             b_v = b_v * b_beta[..., None]
             h = h.clone() + b_k.unsqueeze(-1) * b_v.unsqueeze(-2)
-            o[:, :, i] = torch.einsum("bhd,bhdm->bhm", b_q, h)
+            o[:, :, i] = torch.einsum('bhd,bhdm->bhm', b_q, h)
         o = o.transpose(1, 2).contiguous()
         combined_output = torch.cat([o.flatten(), h.flatten()], dim=0)
         return combined_output
 
 
 def convert_recurrent_linear_cell2(context):
+    import openvino.opset14 as ops
+    import openvino as ov
     import numpy as np
 
-    import openvino as ov
-    import openvino.opset14 as ops
-
+    # context.get_input(0)
     q = context.get_input(0)
     k = context.get_input(1)
     v = context.get_input(2)
@@ -7968,6 +7966,7 @@ def convert_recurrent_linear_cell2(context):
     params = [q, k, v, beta, g, h0]
 
     # L2 norm for q and k along last dim, then scale q by 1/sqrt(K)
+    # l2norm(x) = x * rsqrt(sum(x*x, dim=-1, keepdim=True) + eps)
     last_axis = ops.constant([3], dtype=np.int32)
     eps = ops.constant(1e-6, dtype=np.float32)
 
@@ -7983,83 +7982,112 @@ def convert_recurrent_linear_cell2(context):
     # Compute scale = 1/sqrt(K) from k's last dimension (dynamic-safe)
     k_shape = ops.shape_of(k)
     k_last_idx = ops.constant([3], dtype=np.int64)
-    k_last_dim = ops.gather(k_shape, k_last_idx, ops.constant(0, dtype=np.int64))  # scalar int
-    k_last_float = ops.convert(k_last_dim, np.float32)
-    inv_scale = ops.divide(ops.constant(1.0, dtype=np.float32), ops.sqrt(k_last_float))
-    q_scaled = ops.multiply(q_norm, inv_scale)
+    k_last_dim_i64 = ops.gather(k_shape, k_last_idx, ops.constant(0, dtype=np.int64))
+    k_last_dim_f32 = ops.convert(k_last_dim_i64, "f32")
+    scale = ops.divide(ops.constant(1.0, dtype=np.float32), ops.sqrt(k_last_dim_f32))
+    q_scaled = ops.multiply(q_norm, scale)
 
+    # Preallocate output buffer (same shape as v)
     v_shape = ops.shape_of(v)
+    core_attn_init = ops.broadcast(ops.constant(0.0, dtype=np.float32), v_shape)
 
-    # Trip count: T = q.shape[2]
-    q_shape = ops.shape_of(q)
-    trip_idx = ops.constant([2], dtype=np.int64)
-    trip_count = ops.convert(ops.gather(q_shape, trip_idx, ops.constant(0, dtype=np.int64)), np.int32)
-
-    const_true = ops.constant(True, dtype=bool)
-    const_zero_int = ops.constant(0, dtype=np.int32)
-    const_one_int = ops.constant(1, dtype=np.int32)
-    const_two = ops.constant(2, dtype=np.int32)
-    const_three = ops.constant(3, dtype=np.int32)
-
-    # Build zero output buffer: o = zeros(B, H, T, V)
-    const_zero_f = ops.constant(0, dtype=np.float32)
-    o_buf = ops.broadcast(const_zero_f, v_shape)
-
-    # Loop body parameters
+    # Body params (timestep and sliced inputs)
     timestep = ops.parameter([], np.int32, "timestep")
-    h_param = ops.parameter([-1, -1, -1, -1], np.float32, "h")
-    o_param = ops.parameter([-1, -1, -1, -1], np.float32, "o")
+    # Sliced along axis=1 (time dimension), keep a size-1 dim to squeeze inside body
+    q_i_param = ops.parameter([-1, 1, -1, -1], dtype, "q_i")
+    k_i_param = ops.parameter([-1, 1, -1, -1], dtype, "k_i")
+    v_i_param = ops.parameter([-1, 1, -1, -1], dtype, "v_i")
+    beta_i_param = ops.parameter([-1, 1, -1], dtype, "beta_i")
+    g_i_param = ops.parameter([-1, 1, -1], dtype, "g_i")
+    h_param = ops.parameter([-1, -1, -1, -1], dtype, "h_in")
+    core_attn_buf = ops.parameter([-1, -1, -1, -1], dtype, "core_buf")
 
-    # Gather current timestep slices: q[:,:,t], k[:,:,t], v[:,:,t], beta[:,:,t], g[:,:,t]
-    t_unsq = ops.unsqueeze(timestep, const_zero_int)
-    b_q = ops.gather(q_scaled, t_unsq, const_two)  # B,H,1,K
-    b_k = ops.gather(k_norm, t_unsq, const_two)
-    b_v = ops.gather(v, t_unsq, const_two)
-    b_beta = ops.gather(beta, t_unsq, const_two)  # B,H,1,1
-    b_g = ops.gather(g, t_unsq, const_two)  # B,H,1,1
+    # Squeeze the size-1 time dim
+    const_axis_time = ops.constant(1, dtype=np.int32)
+    b_q = ops.squeeze(q_i_param, const_axis_time)   # (B, H, K)
+    b_k = ops.squeeze(k_i_param, const_axis_time)   # (B, H, K)
+    b_v = ops.squeeze(v_i_param, const_axis_time)   # (B, H, V)
+    b_beta = ops.squeeze(beta_i_param, const_axis_time)  # (B, H)
+    b_g = ops.squeeze(g_i_param, const_axis_time)   # (B, H)
 
-    # h = h * exp(g)
-    g_exp = ops.exp(ops.unsqueeze(ops.unsqueeze(b_g, const_three), const_three))
-    h_decayed = ops.multiply(h_param, g_exp)
+    # h decay: h = h * exp(g[..., None, None])
+    const_minus1 = ops.constant(-1, dtype=np.int32)
+    g_unsq1 = ops.unsqueeze(b_g, const_minus1)
+    g_unsq2 = ops.unsqueeze(g_unsq1, const_minus1)  # (B, H, 1, 1)
+    # Explicit tile exp(g) over K and V to match h shape and avoid broadcast ambiguity
+    exp_g = ops.exp(g_unsq2)  # (B,H,1,1)
+    h_shape = ops.shape_of(h_param)  # (B,H,K,V)
+    k_idx = ops.constant([2], dtype=np.int64)
+    v_idx = ops.constant([3], dtype=np.int64)
+    dim_k = ops.gather(h_shape, k_idx, ops.constant(0, dtype=np.int64))
+    dim_v = ops.gather(h_shape, v_idx, ops.constant(0, dtype=np.int64))
+    # Build tile multipliers relative to (B,H,1,1): set B,H repeats to 1, tile over K and V
+    ones_bh = ops.constant([1, 1], dtype=np.int64)
+    kv_repeats = ops.concat([ones_bh, ops.convert(dim_k, "i64"), ops.convert(dim_v, "i64")], 0)
+    exp_g_tiled = ops.tile(exp_g, kv_repeats)
+    h_decay = ops.multiply(h_param, exp_g_tiled)
 
-    # b_v = b_v - sum(h * k[...,None], dim=-2)  -> einsum bhkv,bhdk->bhdv then sum?
-    # Actually: (h * k[..., None]).sum(-2) = einsum('bhkv,bh1k->bh1v', h, b_k)
-    kv_mem = ops.einsum([h_decayed, b_k], "bhkv,bhdk->bhdv")
-    b_v_new = ops.subtract(b_v, kv_mem)
+    # v_prime = sum_k(h * k) via MatMul: (B,H,V,K) x (B,H,K,1) -> (B,H,V,1) -> (B,H,V)
+    b_k_unsq_v = ops.unsqueeze(b_k, const_minus1)           # (B,H,K,1)
+    h_decay_t = ops.transpose(h_decay, ops.constant([0, 1, 3, 2], dtype=np.int64))
+    v_prime_unsq = ops.matmul(h_decay_t, b_k_unsq_v, False, False)  # (B,H,V,1)
+    v_prime = ops.squeeze(v_prime_unsq, ops.constant(3, dtype=np.int32))
+    v_new = ops.subtract(b_v, v_prime)
+    b_beta_unsq = ops.unsqueeze(b_beta, const_minus1)  # (B,H,1)
+    v_new_shape = ops.shape_of(v_new)
+    b_beta_broad = ops.broadcast(b_beta_unsq, v_new_shape)
+    v_scaled = ops.multiply(v_new, b_beta_broad)
 
-    # b_v = b_v * beta[..., None]
-    b_v_scaled = ops.multiply(b_v_new, ops.unsqueeze(b_beta, const_three))
+    # update h: outer(b_k, v_scaled) via MatMul to avoid broadcast
+    v_scaled_unsq_k = ops.unsqueeze(v_scaled, ops.constant(2, dtype=np.int32))  # (B,H,1,V)
+    b_k_unsq = ops.unsqueeze(b_k, const_minus1)  # (B,H,K,1)
+    h_update = ops.matmul(b_k_unsq, v_scaled_unsq_k, False, False)  # (B,H,K,V)
+    h_res = ops.add(h_decay, h_update)
 
-    # h = h + k[..., None] * b_v[..., None, :]  -> k.unsqueeze(-1) * b_v.unsqueeze(-2)
-    k_unsq = ops.unsqueeze(b_k, const_three)   # B,H,1,K,1
-    v_unsq = ops.unsqueeze(b_v_scaled, const_two)   # B,H,1,1,V  -> need B,H,K,1,V? No...
-    # Actually: b_k is B,H,1,K and b_v_scaled is B,H,1,V
-    # k.unsqueeze(-1) -> B,H,1,K,1; b_v.unsqueeze(-2) -> B,H,1,1,V
-    # outer product -> B,H,1,K,V -> squeeze dim 2 -> B,H,K,V
-    update = ops.einsum([b_k, b_v_scaled], "bhdk,bhdv->bhkv")
-    h_new = ops.add(h_decayed, update)
+    # o_step = sum_k(h * q) via MatMul: (B,H,V,K) x (B,H,K,1) -> (B,H,V,1) -> (B,H,V)
+    b_q_unsq_v = ops.unsqueeze(b_q, const_minus1)           # (B,H,K,1)
+    h_res_t = ops.transpose(h_res, ops.constant([0, 1, 3, 2], dtype=np.int64))
+    o_step_unsq = ops.matmul(h_res_t, b_q_unsq_v, False, False)  # (B,H,V,1)
+    o_step = ops.squeeze(o_step_unsq, ops.constant(3, dtype=np.int32))
+    # write into buffer at timestep along axis=1
+    const_axis_t = ops.constant(1, dtype=np.int32)
+    timestep_unsq = ops.unsqueeze(timestep, ops.constant(0, dtype=np.int32))
+    o_unsq = ops.unsqueeze(o_step, const_axis_t)
+    core_buf_res = ops.scatter_update(core_attn_buf, timestep_unsq, o_unsq, const_axis_t)
 
-    # o[:,:,t] = einsum('bhk,bhkv->bhv', b_q, h)
-    out_t = ops.einsum([b_q, h_new], "bhdk,bhkv->bhdv")
-    # write into buffer at timestep along axis=2
-    o_new = ops.scatter_update(o_param, t_unsq, out_t, const_two)
+    body_cond = ops.constant([True], dtype=bool)
+    body_model = ov.Model([body_cond, h_res, core_buf_res],
+                          [timestep, q_i_param, k_i_param, v_i_param, beta_i_param, g_i_param, h_param, core_attn_buf],
+                          "recurrent_body")
 
-    # Build Loop
-    loop = ov.runtime.op.Loop(trip_count, const_true)
-    body = ov.runtime.Model([const_true, h_new, o_new], [timestep, h_param, o_param])
-    loop.set_function(body)
+    # Trip count: T = shape_of(v)[1] (still dynamic in batch/sequence)
+    v_shape_dyn = ops.shape_of(v)
+    t_index = ops.constant([1], dtype=np.int64)
+    trip_count = ops.convert(ops.gather(v_shape_dyn, t_index, ops.constant(0, dtype=np.int64)), "i32")
 
-    loop.set_merged_input(h_param, h0, h_new.output(0))
-    loop.set_merged_input(o_param, o_buf.output(0), o_new.output(0))
+    loop = ops.loop(trip_count, ops.constant(True, dtype="bool"))
+    loop.set_function(body_model)
+
+    # Map sliced inputs (axis=1 is time)
+    loop.set_sliced_input(q_i_param, q_scaled.output(0), 0, 1, 1, -1, 1)
+    loop.set_sliced_input(k_i_param, k_norm.output(0), 0, 1, 1, -1, 1)
+    loop.set_sliced_input(v_i_param, v, 0, 1, 1, -1, 1)
+    loop.set_sliced_input(g_i_param, g, 0, 1, 1, -1, 1)
+    loop.set_sliced_input(beta_i_param, beta, 0, 1, 1, -1, 1)
+
+    # Merged inputs
+    loop.set_merged_input(h_param, h0, h_res.output(0))
+    loop.set_merged_input(core_attn_buf, core_attn_init.output(0), core_buf_res.output(0))
+
+    # Special ports: [iteration input idx, condition output idx]
     loop.set_special_body_ports([0, 0])
 
-    core_attn_out_new = loop.get_iter_value(o_new.output(0), -1)
-    last_recurrent_state_new = loop.get_iter_value(h_new.output(0), -1)
+    core_attn_final = loop.get_iter_value(core_buf_res.output(0), -1)
+    h_final = loop.get_iter_value(h_res.output(0), -1)
 
     flatten_shape = ops.constant([-1], dtype=np.int32)
-    core_attn_out_new = ops.reshape(core_attn_out_new, flatten_shape, False)
-    last_recurrent_state_new = ops.reshape(last_recurrent_state_new, flatten_shape, False)
-
+    core_attn_out_new = ops.reshape(core_attn_final, flatten_shape, False)
+    last_recurrent_state_new = ops.reshape(h_final, flatten_shape, False)
     final_output = ops.concat([core_attn_out_new, last_recurrent_state_new], 0)
 
     return [final_output.output(0)]

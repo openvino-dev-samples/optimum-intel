@@ -5581,7 +5581,7 @@ class Qwen35TextOpenVINOConfig(MambaOpenVINOConfig):
     DUMMY_PKV_GENERATOR_CLASS = Qwen35DummyPastKeyValuesGenerator
     NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
     MIN_TRANSFORMERS_VERSION = "4.57.0"
-    _MODEL_PATCHER = Qwen35TextModelPatcher
+    # _MODEL_PATCHER = Qwen35TextModelPatcher
 
     def add_past_key_values(self, inputs_or_outputs: Dict[str, Dict[int, str]], direction: str):
         if direction not in ["inputs", "outputs"]:
@@ -5601,7 +5601,7 @@ class Qwen35TextOpenVINOConfig(MambaOpenVINOConfig):
             # conv_state: [batch_size, conv_dim, conv_kernel_size]
             inputs_or_outputs[f"{cache_name_prefix}.conv.{i}"] = {0: "batch_size"}
             # recurrent_state: [batch_size, num_v_heads, key_head_dim, value_head_dim]
-            inputs_or_outputs[f"{cache_name_prefix}.recurrent.{i}"] = {0: "batch_size"}
+            inputs_or_outputs[f"{cache_name_prefix}.ssm.{i}"] = {0: "batch_size"}
 
         for i in range(self.num_atten_layers):
             inputs_or_outputs[f"{cache_name_prefix}.key.{i}"] = {0: "batch_size", 2: decoder_sequence_name}
@@ -5627,4 +5627,5 @@ class Qwen35TextOpenVINOConfig(MambaOpenVINOConfig):
     library_name="transformers",
 )
 class Qwen35MoeTextOpenVINOConfig(Qwen35TextOpenVINOConfig):
-    _MODEL_PATCHER = Qwen35MoeTextModelPatcher
+    # _MODEL_PATCHER = Qwen35MoeTextModelPatcher
+    pass

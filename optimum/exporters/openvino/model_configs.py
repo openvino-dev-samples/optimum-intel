@@ -5581,7 +5581,7 @@ class Qwen35TextOpenVINOConfig(MambaOpenVINOConfig):
     DUMMY_PKV_GENERATOR_CLASS = Qwen35DummyPastKeyValuesGenerator
     NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
     MIN_TRANSFORMERS_VERSION = "4.57.0"
-    # _MODEL_PATCHER = Qwen35TextModelPatcher
+    _MODEL_PATCHER = Qwen35TextModelPatcher
 
     def add_past_key_values(self, inputs_or_outputs: Dict[str, Dict[int, str]], direction: str):
         if direction not in ["inputs", "outputs"]:
@@ -5627,5 +5627,4 @@ class Qwen35TextOpenVINOConfig(MambaOpenVINOConfig):
     library_name="transformers",
 )
 class Qwen35MoeTextOpenVINOConfig(Qwen35TextOpenVINOConfig):
-    # _MODEL_PATCHER = Qwen35MoeTextModelPatcher
-    pass
+    _MODEL_PATCHER = Qwen35MoeTextModelPatcher

@@ -433,22 +433,15 @@ def export_pytorch(
                 if patch_16bit_model:
                     from openvino.frontend.pytorch.patch_model import __make_16bit_traceable
 
-                    import psutil
-                    proc = psutil.Process()
-                    print(f"[DEBUG] Before __make_16bit_traceable: RSS={proc.memory_info().rss / 1e9:.1f} GB", flush=True)
                     __make_16bit_traceable(model)
-                    print(f"[DEBUG] After __make_16bit_traceable: RSS={proc.memory_info().rss / 1e9:.1f} GB", flush=True)
 
                 # Allow patcher to free duplicated memory after 16-bit tracing setup.
                 # __make_16bit_traceable calls module.float() on non-Linear/Embedding modules,
                 # creating fp32 copies of parameters already captured as bf16 views by the patcher.
                 # This hook frees those fp32 duplicates to avoid OOM on large MoE models.
                 if hasattr(patcher, "post_make_16bit_traceable"):
-                    print(f"[DEBUG] Calling post_make_16bit_traceable hook", flush=True)
                     patcher.post_make_16bit_traceable()
-                    print(f"[DEBUG] After post_make_16bit_traceable: RSS={proc.memory_info().rss / 1e9:.1f} GB", flush=True)
-                else:
-                    print(f"[DEBUG] No post_make_16bit_traceable hook found on patcher={type(patcher).__name__}", flush=True)
+
                 conversion_extensions = getattr(patcher, "conversion_extensions", [])
                 module_extensions = getattr(patcher, "module_extensions", None)
                 if module_extensions is not None:
@@ -456,44 +449,49 @@ def export_pytorch(
 
                 example_input = dummy_inputs
 
-                print(f"[DEBUG] Before TorchScriptPythonDecoder: RSS={proc.memory_info().rss / 1e9:.1f} GB" if 'proc' in dir() else "[DEBUG] Before TorchScriptPythonDecoder", flush=True)
-                ts_decoder = TorchScriptPythonDecoder(model, example_input=example_input, **ts_decoder_kwargs)
-                print(f"[DEBUG] After TorchScriptPythonDecoder: RSS={proc.memory_info().rss / 1e9:.1f} GB" if 'proc' in dir() else "[DEBUG] After TorchScriptPythonDecoder", flush=True)
+                # Use shared_memory=False to make OV constants own copies of their
+                # data instead of sharing memory (zero-copy) with PyTorch tensors.
+                # This prevents segfaults during serialization when the shared
+                # PyTorch tensor memory gets freed by Python's reference counting.
+                ts_decoder = TorchScriptPythonDecoder(
+                    model, example_input=example_input,
+                    shared_memory=False,
+                    **ts_decoder_kwargs,
+                )
                 ov_model = convert_model(
                     ts_decoder,
                     example_input=example_input,
                     input=[(item.shape, item.type) for item in input_info],
-                    extension=conversion_extensions,
+                    **({'extension': conversion_extensions} if conversion_extensions else {}),
                 )
-                print(f"[DEBUG] After convert_model: RSS={proc.memory_info().rss / 1e9:.1f} GB" if 'proc' in dir() else "[DEBUG] After convert_model", flush=True)
 
-        ov_model.validate_nodes_and_infer_types()  # TODO: remove as unnecessary validation?
+            ov_model.validate_nodes_and_infer_types()
 
-        output_names = list(config.outputs.keys())
-        for idx, out_tensor in enumerate(ov_model.outputs):
-            if idx < len(output_names):
-                out_tensor.get_tensor().set_names({output_names[idx]})
+            output_names = list(config.outputs.keys())
+            for idx, out_tensor in enumerate(ov_model.outputs):
+                if idx < len(output_names):
+                    out_tensor.get_tensor().set_names({output_names[idx]})
 
-        input_names = [item.name for item in input_info]
-        for idx, inp_tensor in enumerate(ov_model.inputs):
-            input_name = input_names[idx]
-            inp_tensor.get_tensor().set_names({input_name})
+            input_names = [item.name for item in input_info]
+            for idx, inp_tensor in enumerate(ov_model.inputs):
+                input_name = input_names[idx]
+                inp_tensor.get_tensor().set_names({input_name})
 
-        if stateful:
-            patch_stateful(model.config, ov_model)
+            if stateful:
+                patch_stateful(model.config, ov_model)
 
-        library_name = _infer_library_from_model_or_model_class(model=model, library_name=library_name)
+            library_name = _infer_library_from_model_or_model_class(model=model, library_name=library_name)
 
-        _save_model(
-            ov_model,
-            output,
-            ov_config=ov_config,
-            library_name=library_name,
-            config=config,
-        )
-        clear_class_registry()
-        del ov_model
-        del model
+            _save_model(
+                ov_model,
+                output,
+                ov_config=ov_config,
+                library_name=library_name,
+                config=config,
+            )
+            clear_class_registry()
+            del ov_model
+            del model
         gc.collect()
     return input_names, output_names, False
 

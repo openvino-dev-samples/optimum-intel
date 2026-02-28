@@ -5048,7 +5048,7 @@ class _OVQwen35ForCausalLM(OVModelForVisualCausalLM, Qwen3_5Model, Qwen3_5Vision
             image_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
             )
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds.to(inputs_embeds.dtype))
 
         if pixel_values_videos is not None:
             video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
@@ -5056,7 +5056,7 @@ class _OVQwen35ForCausalLM(OVModelForVisualCausalLM, Qwen3_5Model, Qwen3_5Vision
             _, video_mask = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
             )
-            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds.to(inputs_embeds.dtype))
 
         if position_ids is None:
             attention_mask_tensor = (

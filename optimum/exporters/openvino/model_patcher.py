@@ -9139,6 +9139,17 @@ class Qwen35VLLanguageModelPatcher(ModelPatcher):
                 linear_attn_layer.forward = linear_attn_layer._orig_forward
                 linear_attn_layer.chunk_gated_delta_rule = linear_attn_layer._orig_chunk_gated_delta_rule
                 linear_attn_layer.recurrent_gated_delta_rule = linear_attn_layer._orig_recurrent_gated_delta_rule
+        # __make_16bit_traceable(full_model) patches forward on every submodule
+        # (including vision sub-modules like pos_embed) and saves the original
+        # under _openvino_module_extension_patch_orig_forward.  ModelPatcher.__exit__
+        # only restores the root model's forward, so these submodule patches persist
+        # and corrupt later sub-model exports (e.g. vision_embeddings_pos).  Restore
+        # them here so subsequent exports see the original module forwards.
+        _ov_orig_attr = "_openvino_module_extension_patch_orig_forward"
+        for _, sub_module in self._model.named_modules():
+            if hasattr(sub_module, _ov_orig_attr):
+                sub_module.forward = getattr(sub_module, _ov_orig_attr)
+                delattr(sub_module, _ov_orig_attr)
 
 
 class Qwen35MoeVLLanguageModelPatcher(Qwen35VLLanguageModelPatcher):
@@ -9332,3 +9343,14 @@ class Qwen35MoeVLLanguageModelPatcher(Qwen35VLLanguageModelPatcher):
                 sparse_moe_block.forward = sparse_moe_block._orig_forward
                 del sparse_moe_block._gate_up_projs_t
                 del sparse_moe_block._down_projs_t
+        # Restore __make_16bit_traceable patches on submodules (e.g. visual.pos_embed).
+        # __make_16bit_traceable(full_model) patches forward on every submodule that
+        # has a weight tensor (including vision sub-modules) and saves the original
+        # under _openvino_module_extension_patch_orig_forward.  Without this cleanup,
+        # a stale new_forward persists on vision sub-modules and causes the
+        # vision_embeddings_pos export to fail with a TypeError in F.embedding.
+        _ov_orig_attr = "_openvino_module_extension_patch_orig_forward"
+        for _, sub_module in self._model.named_modules():
+            if hasattr(sub_module, _ov_orig_attr):
+                sub_module.forward = getattr(sub_module, _ov_orig_attr)
+                delattr(sub_module, _ov_orig_attr)

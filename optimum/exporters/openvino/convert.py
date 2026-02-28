@@ -435,6 +435,18 @@ def export_pytorch(
 
                     __make_16bit_traceable(model)
 
+                    # __make_16bit_traceable patches all nn.Embedding/nn.Linear submodules,
+                    # including the top-level model when it IS an nn.Embedding or nn.Linear
+                    # (e.g. text_embeddings or vision_embeddings_pos sub-models in VLMs).
+                    # This overwrites the patcher's ts_patched_forward on model.forward,
+                    # breaking the export pipeline. Restore the patcher's forward for the
+                    # top-level module since OpenVINO can handle aten::embedding/aten::linear
+                    # with bf16 weights directly.
+                    orig_forward_name = "_openvino_module_extension_patch_orig_forward"
+                    if hasattr(model, orig_forward_name):
+                        model.forward = getattr(model, orig_forward_name)
+                        delattr(model, orig_forward_name)
+
                 # Allow patcher to free duplicated memory after 16-bit tracing setup.
                 # __make_16bit_traceable calls module.float() on non-Linear/Embedding modules,
                 # creating fp32 copies of parameters already captured as bf16 views by the patcher.

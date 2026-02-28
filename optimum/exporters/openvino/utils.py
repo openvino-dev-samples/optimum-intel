@@ -309,7 +309,12 @@ MULTI_MODAL_TEXT_GENERATION_MODELS = [
     "minicpmo",
 ]
 
-SSM_MODELS = ["mamba", "falcon_mamba", "zamba2", "lfm2", "granitemoehybrid", "qwen3_next", "qwen3_5_text", "qwen3_5_moe_text"]
+SSM_MODELS = ["mamba", "falcon_mamba", "zamba2", "lfm2", "granitemoehybrid", "qwen3_next", "qwen3_5_text", "qwen3_5_moe_text",
+              # VLM wrapper types: patch_stateful needs to route to patch_stateful_hybrid_ssm
+              # because the language sub-model contains both SSM (linear_attention) and
+              # full-attention layers.  The full VLM config model_type is used by
+              # export_pytorch when calling patch_stateful(model.config, ov_model).
+              "qwen3_5", "qwen3_5_moe"]
 
 # All transformers, diffusers, timm and sentence transformers models that are supported via optimum-onnx OnnxConfigs but that have currently no test
 # TODO: add tests for all models that are compatible and remove support for all others

@@ -8484,6 +8484,9 @@ def qwen3_5_gated_delta_net_forward(
 
     hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
+    # Cast hidden_states to match weight dtype for tracing compatibility
+    hidden_states = hidden_states.to(dtype=self.in_proj_qkv.weight.dtype)
+
     batch_size, seq_len, _ = hidden_states.shape
     dtype = hidden_states.dtype
     use_precomputed_states = torch.tensor(seq_len == 1).to(dtype)
@@ -8561,6 +8564,8 @@ def qwen3_5_gated_delta_net_forward(
     core_attn_out = core_attn_out.reshape(z_shape_og)
     core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1)
 
+    # Cast back to weight dtype since recurrent cell operates in float32
+    core_attn_out = core_attn_out.to(dtype=self.out_proj.weight.dtype)
     output = self.out_proj(core_attn_out)
     return output
 
@@ -9280,7 +9285,26 @@ class Qwen35MoeVLLanguageModelPatcher(Qwen35VLLanguageModelPatcher):
         ]
 
     def __enter__(self):
+        import openvino.frontend.pytorch.patch_model as _ov_patch_model
         from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeSparseMoeBlock
+
+        # Ensure 16-bit traceability even when patch_16bit_model=False (i.e. when the
+        # model's config.json has no top-level torch_dtype).  This patches all
+        # nn.Linear / nn.Embedding submodule forwards to handle bf16 weights transparently.
+        # patch_model() is idempotent: it skips modules that already have
+        # _openvino_module_extension_patch_orig_forward, so a second call by convert.py
+        # (when patch_16bit_model=True) is safe.
+        # Use getattr to avoid Python name-mangling of double-underscore names inside a class.
+        make_16bit_traceable = getattr(_ov_patch_model, "__make_16bit_traceable")
+        make_16bit_traceable(self._model)
+        # __make_16bit_traceable also wraps the top-level model.forward with a
+        # new_forward(*args,**kwargs) trampoline, saving the original under
+        # _openvino_module_extension_patch_orig_forward.  Restore it so that
+        # ModelPatcher.__enter__ below captures the real original forward.
+        _orig_attr = "_openvino_module_extension_patch_orig_forward"
+        if hasattr(self._model, _orig_attr):
+            self._model.forward = getattr(self._model, _orig_attr)
+            delattr(self._model, _orig_attr)
 
         # Call ModelPatcher.__enter__ directly (not Qwen35VLLanguageModelPatcher.__enter__)
         ModelPatcher.__enter__(self)

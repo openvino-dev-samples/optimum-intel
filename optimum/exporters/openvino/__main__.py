@@ -12,6 +12,32 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+# Compatibility shim: inject _CAN_RECORD_REGISTRY and OutputRecorder into
+# transformers.utils.generic if the installed transformers version is too old
+# to have them.  optimum.exporters.onnx._traceable_decorator imports these
+# symbols unconditionally, so they must exist before that module is first
+# imported.  This must run before any other import that may trigger
+# _traceable_decorator to load.
+import importlib as _importlib
+
+_tug = _importlib.import_module("transformers.utils.generic")
+if not hasattr(_tug, "_CAN_RECORD_REGISTRY"):
+    import transformers as _transformers
+
+    _tug.logger = _transformers.utils.logging.get_logger(_tug.__name__)
+    _tug._CAN_RECORD_REGISTRY = {}
+
+    class _OutputRecorder:
+        def __init__(self, target_class=None, index=0, class_name=None, layer_name=None):
+            self.target_class = target_class
+            self.index = index
+            self.class_name = class_name
+            self.layer_name = layer_name
+
+    _tug.OutputRecorder = _OutputRecorder
+    del _transformers, _OutputRecorder
+del _importlib, _tug
+
 import gc
 import importlib.util
 import logging

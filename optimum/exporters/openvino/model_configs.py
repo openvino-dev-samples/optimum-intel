@@ -17,6 +17,8 @@ import logging
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
+import torch
+
 from transformers import AutoConfig, PretrainedConfig, PreTrainedModel
 
 from optimum.exporters.onnx.config import OnnxConfig, TextDecoderOnnxConfig, TextDecoderWithPositionIdsOnnxConfig
@@ -3823,6 +3825,23 @@ class Qwen2_5_VLOpenVINOConfig(Qwen2VLOpenVINOConfig):
         return super().patch_model_for_export(model, model_kwargs)
 
 
+class QwenVLPosEmbedWrapper(torch.nn.Module):
+    """Thin wrapper around nn.Embedding (pos_embed) for VISION_EMBEDDINGS_POS export.
+
+    Wrapping ensures that ``check_dummy_inputs_are_allowed`` always sees a clean,
+    inspectable ``forward(self, input)`` signature regardless of any patching
+    that may have been applied to the underlying embedding by ``__make_16bit_traceable``
+    during a preceding LANGUAGE-model export.
+    """
+
+    def __init__(self, pos_embed: torch.nn.Embedding):
+        super().__init__()
+        self.pos_embed = pos_embed
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:  # noqa: A002
+        return self.pos_embed(input)
+
+
 @register_in_tasks_manager(
     "qwen3_vl",
     *["image-text-to-text"],
@@ -3858,9 +3877,10 @@ class Qwen3VLOpenVINOConfig(Qwen2VLOpenVINOConfig):
     @staticmethod
     def get_model_for_behavior(model, behavior: Union[str, QwenVLConfigBehavior]):
         if behavior == QwenVLConfigBehavior.VISION_EMBEDDINGS_POS:
-            vision_emb_pos = _get_model_attribute(model, "visual").pos_embed
-            vision_emb_pos.config = model.config.vision_config
-            return vision_emb_pos
+            pos_embed = _get_model_attribute(model, "visual").pos_embed
+            wrapper = QwenVLPosEmbedWrapper(pos_embed)
+            wrapper.config = model.config.vision_config
+            return wrapper
 
         return Qwen2VLOpenVINOConfig.get_model_for_behavior(model, behavior)
 

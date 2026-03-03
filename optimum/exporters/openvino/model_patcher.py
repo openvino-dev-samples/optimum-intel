@@ -9119,6 +9119,21 @@ class Qwen35VLLanguageModelPatcher(ModelPatcher):
         ]
 
     def __enter__(self):
+        import openvino.frontend.pytorch.patch_model as _ov_patch_model
+
+        # Ensure 16-bit traceability even when patch_16bit_model=False (i.e. when the
+        # model's config.json has no top-level torch_dtype).  patch_model() is idempotent:
+        # modules already patched are skipped, so a second call by convert.py is safe.
+        # Use getattr to avoid Python name-mangling of double-underscore names inside a class.
+        make_16bit_traceable = getattr(_ov_patch_model, "__make_16bit_traceable")
+        make_16bit_traceable(self._model)
+        # Restore top-level model.forward so ModelPatcher.__enter__ captures the real
+        # original forward (not the *args/**kwargs trampoline written by patch_model).
+        _orig_attr = "_openvino_module_extension_patch_orig_forward"
+        if hasattr(self._model, _orig_attr):
+            self._model.forward = getattr(self._model, _orig_attr)
+            delattr(self._model, _orig_attr)
+
         super().__enter__()
         setattr(self._model, self.orig_forward_name, self.patched_forward)
 

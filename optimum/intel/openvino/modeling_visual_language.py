@@ -121,8 +121,26 @@ class OVModelWithEmbedForCausalLM(OVModelForCausalLM):
                 self.text_emb_request = self.text_emb_model
             else:
                 logger.info(f"Compiling the Text embeddings model to {self._device} ...")
+                # OpenVINO's Python/numpy bridge has no native bfloat16 dtype, so
+                # bfloat16 output tensors are returned with dtype=float16 in numpy
+                # (same 2-byte size, wrong bit layout → wrong values, ~80x error).
+                # Insert a Cast→f32 node for any bfloat16 outputs so the request
+                # always returns float32 data that translates correctly via numpy.
+                model_to_compile = self.text_emb_model
+                if isinstance(model_to_compile, ov.Model):
+                    from openvino.preprocess import PrePostProcessor
+                    needs_cast = any(
+                        out.get_element_type() == ov.Type.bf16
+                        for out in model_to_compile.outputs
+                    )
+                    if needs_cast:
+                        ppp = PrePostProcessor(model_to_compile)
+                        for idx, out in enumerate(model_to_compile.outputs):
+                            if out.get_element_type() == ov.Type.bf16:
+                                ppp.output(idx).tensor().set_element_type(ov.Type.f32)
+                        model_to_compile = ppp.build()
                 self.text_emb_request = self._compile_model(
-                    self.text_emb_model, self._device, self.ov_config, self.model_save_dir
+                    model_to_compile, self._device, self.ov_config, self.model_save_dir
                 )
 
     def clear_requests(self):
@@ -784,7 +802,6 @@ class OVModelForVisualCausalLM(OVBaseModel, GenerationMixin):
         if self.config.model_type in ("qwen3_vl",) and extra_outputs:
             additional_kwargs["visual_pos_masks"] = extra_outputs[0]
             additional_kwargs["deepstack_visual_embeds"] = extra_outputs[1]
-
         return self.language_model.forward(
             input_ids=None,
             inputs_embeds=inputs_embeds,

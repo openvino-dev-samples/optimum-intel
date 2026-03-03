@@ -430,7 +430,17 @@ def export_pytorch(
 
                 ov_model = convert_model(ep)
             else:
-                if patch_16bit_model:
+                # Auto-enable 16-bit tracing if the model actually has bf16/fp16 weights,
+                # regardless of whether the caller set patch_16bit_model=True.  This covers
+                # sub-models (e.g. VISION_EMBEDDINGS) that are exported with patch_16bit_model=False
+                # because the top-level config.json has no torch_dtype field.
+                # Use any() so we detect models whose FIRST parameter is float32 (e.g. a rotary
+                # frequency buffer) but whose Linear/Embedding weights are bf16/fp16.
+                _16bit_dtypes = {torch.float16, torch.bfloat16}
+                _need_16bit_patch = patch_16bit_model or any(
+                    p.dtype in _16bit_dtypes for p in model.parameters()
+                )
+                if _need_16bit_patch:
                     from openvino.frontend.pytorch.patch_model import __make_16bit_traceable
 
                     __make_16bit_traceable(model)

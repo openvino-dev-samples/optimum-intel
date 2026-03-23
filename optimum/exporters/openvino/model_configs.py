@@ -172,6 +172,7 @@ from .model_patcher import (
     MambaPatcher,
     MarianModelPatcher,
     MiniCPM3Patcher,
+    MiniCPM5MoEModelPatcher,
     MiniCPMModelPatcher,
     MiniCPMVImageEmbeddingsModelPatcher,
     MiniCPMVResamplerModelPatcher,
@@ -542,6 +543,17 @@ class MiniCPM3OpenVINOConfig(TextDecoderWithPositionIdsOnnxConfig):
     DUMMY_PKV_GENERATOR_CLASS = OVMiniCPM3DummyPastKeyValuesGenerator
     NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
     _MODEL_PATCHER = MiniCPM3Patcher
+
+
+@register_in_tasks_manager(
+    "minicpm5_moe", *["text-generation", "text-generation-with-past"], library_name="transformers"
+)
+class MiniCPM5MoEOpenVINOConfig(TextDecoderWithPositionIdsOnnxConfig):
+    DEFAULT_ONNX_OPSET = 14
+    DUMMY_INPUT_GENERATOR_CLASSES = (DummyTextInputGenerator, MistralDummyPastKeyValuesGenerator)
+    DUMMY_PKV_GENERATOR_CLASS = MistralDummyPastKeyValuesGenerator
+    NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
+    _MODEL_PATCHER = MiniCPM5MoEModelPatcher
 
 
 @register_in_tasks_manager("stablelm", *["text-generation", "text-generation-with-past"], library_name="transformers")

@@ -8319,3 +8319,83 @@ class Qwen3NextModelPatcher(OVDecoderModelPatcher):
                 sparse_moe_block = decoder_layer.mlp
                 decoder_layer.mlp.forward = decoder_layer.mlp._orig_forward
                 del sparse_moe_block.down_projs, sparse_moe_block.gate_projs, sparse_moe_block.up_projs
+
+
+def minicpm5_moe_forward_patched(self, hidden_states):
+    num_experts = self.config.n_routed_experts
+    batch_size, seq_len, hidden_dim = hidden_states.shape
+
+    # Get routing decisions
+    topk_indices, topk_weights = self.gate(hidden_states)
+
+    # Create full routing weight matrix [batch*seq, num_experts]
+    new_routing_weights = torch.zeros(batch_size * seq_len, num_experts, dtype=topk_weights.dtype)
+    new_routing_weights.scatter_(dim=1, index=topk_indices, src=topk_weights)
+
+    hidden_states_flat = hidden_states.view(-1, hidden_dim)
+
+    # Process shared experts
+    shared_output = self.shared_experts(hidden_states_flat)
+
+    # Vectorized expert computation using batched matmul
+    hidden_states_rep = hidden_states_flat.repeat(num_experts, 1).view(num_experts, -1, hidden_dim)
+    act_fn = self.experts[0].act_fn
+
+    gate = torch.bmm(hidden_states_rep, self.gate_projs)
+    up = torch.bmm(hidden_states_rep, self.up_projs)
+    gate_up = act_fn(gate) * up
+    next_states = torch.bmm(gate_up, self.down_projs)
+
+    next_states = next_states.view(num_experts, batch_size, -1, hidden_dim)
+    next_states = next_states * new_routing_weights.transpose(0, 1).view(num_experts, batch_size, -1)[..., None]
+    next_states = next_states.sum(dim=0)
+
+    shared_output = shared_output.view(batch_size, -1, hidden_dim)
+    output = shared_output + next_states
+    return output.view(batch_size, seq_len, hidden_dim)
+
+
+class MiniCPM5MoEModelPatcher(OVDecoderModelPatcher):
+    def __enter__(self):
+        super().__enter__()
+        for layer in self._model.model.layers:
+            if hasattr(layer.mlp, "experts"):
+                moe = layer.mlp
+                num_experts = moe.config.n_routed_experts
+                moe._orig_forward = moe.forward
+                moe.forward = types.MethodType(minicpm5_moe_forward_patched, moe)
+
+                # Prepare batched weight matrices for vectorized MoE computation
+                # Use float() to align with hidden_states dtype during tracing (fp32)
+                moe.down_projs = (
+                    torch.concat(
+                        tuple(moe.experts[i].down_proj.weight.unsqueeze(0) for i in range(num_experts)),
+                        dim=0,
+                    )
+                    .transpose(1, 2)
+                    .float()
+                )
+                moe.gate_projs = (
+                    torch.concat(
+                        tuple(moe.experts[i].gate_proj.weight.unsqueeze(0) for i in range(num_experts)),
+                        dim=0,
+                    )
+                    .transpose(1, 2)
+                    .float()
+                )
+                moe.up_projs = (
+                    torch.concat(
+                        tuple(moe.experts[i].up_proj.weight.unsqueeze(0) for i in range(num_experts)),
+                        dim=0,
+                    )
+                    .transpose(1, 2)
+                    .float()
+                )
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+        for layer in self._model.model.layers:
+            if hasattr(layer.mlp, "experts"):
+                moe = layer.mlp
+                moe.forward = moe._orig_forward
+                del moe.down_projs, moe.gate_projs, moe.up_projs

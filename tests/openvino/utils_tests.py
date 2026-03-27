@@ -135,6 +135,7 @@ MODEL_NAMES = {
     "mbart": "optimum-intel-internal-testing/tiny-random-mbart",
     "minicpm": "optimum-intel-internal-testing/tiny-random-minicpm",
     "minicpm3": "optimum-intel-internal-testing/tiny-random-minicpm3",
+    "minicpm5_moe": "d:/minicpm5.16a3.v0314",
     "minicpmv": "optimum-intel-internal-testing/tiny-random-minicpmv-2_6",
     "minicpmo": "optimum-intel-internal-testing/tiny-random-MiniCPM-o-2_6",
     "mistral": "optimum-intel-internal-testing/tiny-random-mistral",
@@ -397,6 +398,7 @@ REMOTE_CODE_MODELS = (
     "exaone4",
     "decilm",
     "minicpm3",
+    "minicpm5_moe",
     "deepseek",
     "qwen3_eagle3",
 )

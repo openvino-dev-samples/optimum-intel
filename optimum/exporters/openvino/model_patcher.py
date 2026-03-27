@@ -8333,15 +8333,18 @@ def minicpm5_moe_forward_patched(self, hidden_states):
       Reshape(2D) → Tile → Reshape(3D) → 3× MatMul(tb=true) + Swish·Mul (SwiGLU)
       → Reshape(4D) → Multiply(routing) → ReduceSum
 
-    Routing pattern (matched by FuseMOE3GemmCompressed's Softmax branch):
-      MatMul(gate_linear) → Softmax → TopK → ReduceSum → Divide (normalize)
-      → ScatterElementsUpdate → Transpose → Reshape → Unsqueeze
+    Routing pattern (matched by FuseMOE3GemmCompressed's Sigmoid+bias branch):
+      MatMul(gate_linear) → Sigmoid → Add(bias) → TopK
+      → GatherElements(Sigmoid) → ReduceSum → Add(eps) → Divide
+      → Slice → ScatterElementsUpdate → Transpose → Reshape → Unsqueeze
 
-    The original model uses topk_weight * scaling_factor (no normalization).
-    To match the fusion pattern, we normalize the routing weights and apply a
-    correction multiply after ReduceSum to maintain computational equivalence:
-      result = fused_output * (topk_sum * scaling_factor)
-    where fused_output uses normalized weights internally.
+    The original MiniCPM5 model uses **sigmoid** routing with e_score_correction_bias
+    for expert selection, then gathers original (unbiased) scores as weights, normalizes
+    with (sum + eps), and applies routed_scaling_factor.
+
+    The GPU fusion kernel handles sigmoid+bias routing internally.  After fusion the
+    kernel produces sum_i(expert_i * w_norm_i).  We apply a post-fusion correction
+    multiply by scaling_factor to match the original semantics.
     """
     num_experts = self.config.n_routed_experts
     top_k = self.config.num_experts_per_tok
@@ -8352,34 +8355,47 @@ def minicpm5_moe_forward_patched(self, hidden_states):
     # FuseMOE3GemmCompressed matches this as `hidden_state_reshape`.
     hidden_states_flat = hidden_states.view(-1, hidden_dim)
 
-    # ── Inlined gate routing (clean Softmax→TopK→Normalize pattern) ──
+    # ── Inlined gate routing (Sigmoid+bias → TopK → GatherElements → Normalize) ──
     # F.linear traces to MatMul(false, true) — matched as `matmul` by FuseMOE3GemmCompressed.
-    # Must have exactly 1 consumer (Softmax) for consumers_count(1) constraint.
+    # Must have exactly 1 consumer (Sigmoid) for consumers_count(1) constraint.
     # Do NOT cast hidden_states_flat — a Convert between Reshape and MatMul would
     # break the `hidden_state_reshape → matmul` pattern match.
     logits = torch.nn.functional.linear(hidden_states_flat, self.gate.weight.float())
-    scores = logits.softmax(dim=-1)
-    topk_weights, topk_indices = torch.topk(scores, k=top_k, dim=-1, sorted=False)
 
-    # Normalize: ReduceSum → Divide — matches FuseMOE3GemmCompressed's sm_reduce → sm_norm.
-    # IMPORTANT: The normalization ReduceSum MUST have exactly 1 consumer (Divide) to
-    # satisfy consumers_count(1) in the pattern. The correction uses a SEPARATE .sum()
-    # call so that two distinct ReduceSum nodes are created in the trace.
+    # Sigmoid — traces to ov::Sigmoid.  Multiple consumers: Add (biased selection)
+    # and GatherElements (actual weight gathering).  No consumers_count constraint.
+    scores = torch.sigmoid(logits)
+
+    # Add(bias) — correction bias shifts scores for expert *selection* only.
+    # consumers_count(1): only TopK consumes this.
+    biased_scores = scores + self.gate.e_score_correction_bias.float()
+
+    # TopK on biased scores — selects which experts to activate.
+    # Output 0 (values) is unused; output 1 (indices) feeds GatherElements + Scatter.
+    _, topk_indices = torch.topk(biased_scores, k=top_k, dim=-1, sorted=False)
+
+    # GatherElements: gather *original* sigmoid scores (not biased) using topk indices.
+    # This matches the fusion pattern's sig_gather_el = GatherElements(sig_sigmoid, topk).
+    # Multiple consumers: ReduceSum and Divide.
+    topk_weights = torch.gather(scores, 1, topk_indices)
+
+    # ReduceSum → consumers_count(1) → Add(eps)
     topk_sum = topk_weights.sum(dim=-1, keepdim=True)
-    topk_norm = topk_weights / topk_sum
+
+    # Add(eps) — scalar epsilon for numerical stability.
+    # consumers_count(1) → Divide
+    topk_sum_eps = topk_sum + 1e-20
+
+    # Divide (normalize) — consumers_count(1).
+    # PyTorch's scatter_ trace produces a natural Slice between Divide and
+    # ScatterElementsUpdate; the GPU fusion pattern's optional sig_slice matches it.
+    # Do NOT add an explicit slice here — two consecutive Slices would break the
+    # single-optional-Slice pattern in FuseMOE3GemmCompressed.
+    topk_norm = topk_weights / topk_sum_eps
 
     # Full routing weight matrix [batch*seq, num_experts] via Broadcast + ScatterElementsUpdate
     new_routing_weights = torch.zeros(batch_size * seq_len, num_experts, dtype=topk_norm.dtype)
     new_routing_weights.scatter_(dim=1, index=topk_indices, src=topk_norm)
-
-    # Correction factor for post-ReduceSum compensation.
-    # CRITICAL: The normalization ReduceSum above must have exactly 1 consumer (Divide).
-    # We compute the correction sum via CumSum + Slice instead of ReduceSum.
-    # cumsum(topk_weights)[:, -1:] == topk_weights.sum(dim=-1, keepdim=True)
-    # This traces to CumSum + Slice (not ReduceSum), so the tracer cannot merge it
-    # with the normalization ReduceSum.
-    correction_sum = topk_weights.cumsum(dim=-1)[:, -1:]  # [batch*seq, 1]
-    correction = (correction_sum * scaling_factor).view(batch_size, seq_len, 1)
 
     # Shared experts (outside MoE pattern, added after correction)
     shared_output = self.shared_experts(hidden_states_flat)
@@ -8388,13 +8404,13 @@ def minicpm5_moe_forward_patched(self, hidden_states):
     # Tile → Reshape(3D) — matches pattern's `tile → after_tile_reshape`
     hidden_states_rep = hidden_states_flat.repeat(num_experts, 1).view(num_experts, -1, hidden_dim)
 
-    # 3× bmm traces to MatMul(tb=false); VectorizedMOE3GEMMTransposeWeights (MOC)
-    # converts these to MatMul(tb=true) so FuseVectorizedMOE3GEMM can match.
-    gate = torch.bmm(hidden_states_rep, self.gate_projs)
-    up = torch.bmm(hidden_states_rep, self.up_projs)
+    # Weights are [E, N, K]; .transpose(-1,-2) produces [E, K, N] as a Transpose node
+    # in the IR. TransposeMatMul (MOC) absorbs it → MatMul(tb=true) with Constant[E,N,K].
+    gate = torch.bmm(hidden_states_rep, self.gate_projs.transpose(-1, -2))
+    up = torch.bmm(hidden_states_rep, self.up_projs.transpose(-1, -2))
     # SiLU traces to aten::silu → ov::Swish; together with Multiply this is SwiGLU.
     gate_up = torch.nn.functional.silu(gate) * up
-    next_states = torch.bmm(gate_up, self.down_projs)
+    next_states = torch.bmm(gate_up, self.down_projs.transpose(-1, -2))
 
     # Reshape(4D) → Multiply(routing) → ReduceSum — pattern tail
     # FuseVectorizedMOE3GEMM matches up to ReduceSum (pattern root).
@@ -8403,11 +8419,10 @@ def minicpm5_moe_forward_patched(self, hidden_states):
     next_states = next_states.sum(dim=0)
 
     # ── Correction multiply (outside fused pattern) ──
-    # The fused kernel applies normalized routing: sum_i(expert_i * w_i / sum_w).
-    # Original model applies: sum_i(expert_i * w_i) * scaling_factor.
-    # Multiply by (topk_sum * scaling_factor) to restore equivalence:
-    #   sum_i(expert_i * w_i/sum_w) * sum_w * scaling = sum_i(expert_i * w_i) * scaling
-    next_states = next_states * correction
+    # The fused kernel computes: sum_i(expert_i * w_i / (sum_w + eps))
+    # The original model computes: sum_i(expert_i * w_i / (sum_w + eps)) * scaling_factor
+    # So we just multiply by the constant scaling_factor.
+    next_states = next_states * scaling_factor
 
     shared_output = shared_output.view(batch_size, -1, hidden_dim)
     output = shared_output + next_states
@@ -8424,14 +8439,17 @@ class MiniCPM5MoEModelPatcher(OVDecoderModelPatcher):
                 moe._orig_forward = moe.forward
                 moe.forward = types.MethodType(minicpm5_moe_forward_patched, moe)
 
-                # Prepare batched weight matrices for vectorized MoE computation
-                # Use float() to align with hidden_states dtype during tracing (fp32)
+                # Prepare batched weight matrices for vectorized MoE computation.
+                # Keep weights in original [E, out_features, in_features] = [E, N, K] layout
+                # (do NOT pre-transpose). The forward pass uses .transpose(-1,-2) which
+                # traces as a Transpose node in the IR. TransposeMatMul (MOC) absorbs it
+                # into MatMul(tb=true), leaving Constant[E,N,K] — the layout that
+                # ConvertMOEToMOECompressed expects for group-compressed INT4 weights.
                 moe.down_projs = (
                     torch.concat(
                         tuple(moe.experts[i].down_proj.weight.unsqueeze(0) for i in range(num_experts)),
                         dim=0,
                     )
-                    .transpose(1, 2)
                     .float()
                 )
                 moe.gate_projs = (
@@ -8439,7 +8457,6 @@ class MiniCPM5MoEModelPatcher(OVDecoderModelPatcher):
                         tuple(moe.experts[i].gate_proj.weight.unsqueeze(0) for i in range(num_experts)),
                         dim=0,
                     )
-                    .transpose(1, 2)
                     .float()
                 )
                 moe.up_projs = (
@@ -8447,7 +8464,6 @@ class MiniCPM5MoEModelPatcher(OVDecoderModelPatcher):
                         tuple(moe.experts[i].up_proj.weight.unsqueeze(0) for i in range(num_experts)),
                         dim=0,
                     )
-                    .transpose(1, 2)
                     .float()
                 )
 

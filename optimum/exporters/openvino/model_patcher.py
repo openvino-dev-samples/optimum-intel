@@ -8319,3 +8319,778 @@ class Qwen3NextModelPatcher(OVDecoderModelPatcher):
                 sparse_moe_block = decoder_layer.mlp
                 decoder_layer.mlp.forward = decoder_layer.mlp._orig_forward
                 del sparse_moe_block.down_projs, sparse_moe_block.gate_projs, sparse_moe_block.up_projs
+
+
+def _pad_and_stack(tensors, padding_value=0.0):
+    """Replaces pad_sequence: pad tensors to max length and stack into batch tensor."""
+    max_len = max(t.shape[0] for t in tensors)
+    padded = []
+    for t in tensors:
+        pad_len = max_len - t.shape[0]
+        # Always apply padding (0-padding is a no-op, avoids conditional branching)
+        pad_sizes = [0] * (2 * (t.ndim - 1)) + [0, pad_len]
+        t = torch.nn.functional.pad(t, pad_sizes, value=padding_value)
+        padded.append(t)
+    return torch.stack(padded, dim=0)
+
+
+def _zimage_forward(
+    self,
+    hidden_states,
+    timestep,
+    encoder_hidden_states,
+) -> torch.Tensor:
+    """Modified forward with renamed inputs and transformer_z_image behavior"""
+    # Convert inputs from batch tensors to lists
+    x = list(torch.unbind(hidden_states, dim=0))
+    t = timestep
+    cap_feats = list(torch.unbind(encoder_hidden_states, dim=0))
+
+    # Use default patch sizes
+    patch_size = 2
+    f_patch_size = 1
+
+    bsz = len(x)
+    device = x[0].device
+    t = t * self.t_scale
+    t = self.t_embedder(t)
+
+    (
+        x,
+        cap_feats,
+        x_size,
+        x_pos_ids,
+        cap_pos_ids,
+        x_inner_pad_mask,
+        cap_inner_pad_mask,
+    ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
+
+    # x embed & refine
+    x_item_seqlens = [_.shape[0] for _ in x]
+    x_max_item_seqlen = max(x_item_seqlens)
+
+    x = torch.cat(x, dim=0)
+    x = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](x)
+
+    adaln_input = t.type_as(x)
+    x_flat_mask = torch.cat(x_inner_pad_mask)
+    x = torch.where(x_flat_mask.unsqueeze(-1), self.x_pad_token, x)
+    x = list(x.split(x_item_seqlens, dim=0))
+    x_freqs_cis = list(self.rope_embedder(torch.cat(x_pos_ids, dim=0)).split(x_item_seqlens, dim=0))
+
+    x = _pad_and_stack(x, padding_value=0.0)
+    x_freqs_cis = _pad_and_stack(x_freqs_cis, padding_value=0.0)
+    x_attn_mask = torch.zeros((bsz, x_max_item_seqlen), dtype=torch.bool, device=device)
+    for i, seq_len in enumerate(x_item_seqlens):
+        x_attn_mask[i, :seq_len] = 1
+
+    for layer in self.noise_refiner:
+        x = layer(x, x_attn_mask, x_freqs_cis, adaln_input)
+
+    # cap embed & refine
+    cap_item_seqlens = [_.shape[0] for _ in cap_feats]
+    cap_max_item_seqlen = max(cap_item_seqlens)
+
+    cap_feats = torch.cat(cap_feats, dim=0)
+    cap_feats = self.cap_embedder(cap_feats)
+    cap_flat_mask = torch.cat(cap_inner_pad_mask)
+    cap_feats = torch.where(cap_flat_mask.unsqueeze(-1), self.cap_pad_token, cap_feats)
+    cap_feats = list(cap_feats.split(cap_item_seqlens, dim=0))
+    cap_freqs_cis = list(self.rope_embedder(torch.cat(cap_pos_ids, dim=0)).split(cap_item_seqlens, dim=0))
+
+    cap_feats = _pad_and_stack(cap_feats, padding_value=0.0)
+    cap_freqs_cis = _pad_and_stack(cap_freqs_cis, padding_value=0.0)
+    cap_attn_mask = torch.zeros((bsz, cap_max_item_seqlen), dtype=torch.bool, device=device)
+    for i, seq_len in enumerate(cap_item_seqlens):
+        cap_attn_mask[i, :seq_len] = 1
+
+    for layer in self.context_refiner:
+        cap_feats = layer(cap_feats, cap_attn_mask, cap_freqs_cis)
+
+    # unified
+    unified = []
+    unified_freqs_cis = []
+    for i in range(bsz):
+        x_len = x_item_seqlens[i]
+        cap_len = cap_item_seqlens[i]
+        unified.append(torch.cat([x[i][:x_len], cap_feats[i][:cap_len]]))
+        unified_freqs_cis.append(torch.cat([x_freqs_cis[i][:x_len], cap_freqs_cis[i][:cap_len]]))
+    unified_item_seqlens = [a + b for a, b in zip(cap_item_seqlens, x_item_seqlens)]
+    unified_max_item_seqlen = max(unified_item_seqlens)
+
+    unified = _pad_and_stack(unified, padding_value=0.0)
+    unified_freqs_cis = _pad_and_stack(unified_freqs_cis, padding_value=0.0)
+    unified_attn_mask = torch.zeros((bsz, unified_max_item_seqlen), dtype=torch.bool, device=device)
+    for i, seq_len in enumerate(unified_item_seqlens):
+        unified_attn_mask[i, :seq_len] = 1
+
+    for layer in self.layers:
+        unified = layer(unified, unified_attn_mask, unified_freqs_cis, adaln_input)
+
+    unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](unified, adaln_input)
+    unified = list(unified.unbind(dim=0))
+    x = self.unpatchify(unified, x_size, patch_size, f_patch_size)
+
+    return x[0]
+
+
+def _zimage_rope_embedder_precompute_freqs_cis(dim: List[int], end: List[int], theta: float = 256.0):
+    with torch.device("cpu"):
+        freqs_cis = []
+        for i, (d, e) in enumerate(zip(dim, end)):
+            freqs = 1.0 / (theta ** (torch.arange(0, d, 2, dtype=torch.float64, device="cpu") / d))
+            timestep = torch.arange(e, device=freqs.device, dtype=torch.float64)
+            freqs = torch.outer(timestep, freqs).float()
+            cos_vals = torch.cos(freqs).repeat_interleave(2, dim=1, output_size=freqs.shape[1] * 2).float()
+            sin_vals = torch.sin(freqs).repeat_interleave(2, dim=1, output_size=freqs.shape[1] * 2).float()
+            freqs_cis_i = torch.stack([cos_vals, sin_vals], dim=-1)
+            freqs_cis.append(freqs_cis_i)
+
+        return freqs_cis
+
+
+def _zimage_rope_embedder_call(self, ids: torch.Tensor):
+    """Modified __call__ to use real RoPE embeddings"""
+    assert ids.ndim == 2
+    assert ids.shape[-1] == len(self.axes_dims)
+    result = []
+    for i in range(len(self.axes_dims)):
+        index = ids[:, i]
+        result.append(self.freqs_cis[i][index])
+    return torch.cat(result, dim=-2)
+
+
+def _zimage_attn_processor_call(
+    self,
+    attn,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states=None,
+    attention_mask=None,
+    freqs_cis=None,
+) -> torch.Tensor:
+    """Modified attention processor __call__ with real RoPE embeddings"""
+    from diffusers.models.attention_dispatch import dispatch_attention_fn
+
+    query = attn.to_q(hidden_states)
+    key = attn.to_k(hidden_states)
+    value = attn.to_v(hidden_states)
+
+    query = query.unflatten(-1, (attn.heads, -1))
+    key = key.unflatten(-1, (attn.heads, -1))
+    value = value.unflatten(-1, (attn.heads, -1))
+
+    if attn.norm_q is not None:
+        query = attn.norm_q(query)
+    if attn.norm_k is not None:
+        key = attn.norm_k(key)
+
+    def apply_rotary_emb(x_in: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+        with torch.amp.autocast("cuda", enabled=False):
+            cos = freqs_cis[..., 0].unsqueeze(-2)
+            sin = freqs_cis[..., 1].unsqueeze(-2)
+            x_real, x_imag = x_in.float().reshape(*x_in.shape[:-1], -1, 2).unbind(-1)
+            x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
+            out = (x_in.float() * cos + x_rotated.float() * sin).to(x_in.dtype)
+            return out
+
+    if freqs_cis is not None:
+        query = apply_rotary_emb(query, freqs_cis)
+        key = apply_rotary_emb(key, freqs_cis)
+
+    dtype = query.dtype
+    query, key = query.to(dtype), key.to(dtype)
+
+    if attention_mask is not None and attention_mask.ndim == 2:
+        attention_mask = attention_mask[:, None, None, :]
+
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(torch.float32)
+
+    hidden_states = dispatch_attention_fn(
+        query,
+        key,
+        value,
+        attn_mask=attention_mask,
+        dropout_p=0.0,
+        is_causal=False,
+        backend=self._attention_backend,
+        parallel_config=self._parallel_config,
+    )
+
+    hidden_states = hidden_states.flatten(2, 3)
+    hidden_states = hidden_states.to(dtype)
+
+    output = attn.to_out[0](hidden_states)
+    if len(attn.to_out) > 1:
+        output = attn.to_out[1](output)
+
+    return output
+
+
+def _zimage_patchify_and_embed(
+    self,
+    all_image,
+    all_cap_feats,
+    patch_size: int,
+    f_patch_size: int,
+):
+    """Modified patchify_and_embed to use .size(0) instead of len() and torch.where"""
+    pH = pW = patch_size
+    pF = f_patch_size
+    device = all_image[0].device
+
+    all_image_out = []
+    all_image_size = []
+    all_image_pos_ids = []
+    all_image_pad_mask = []
+    all_cap_pos_ids = []
+    all_cap_pad_mask = []
+    all_cap_feats_out = []
+
+    for i, (image, cap_feat) in enumerate(zip(all_image, all_cap_feats)):
+        ### Process Caption
+        cap_ori_len = cap_feat.size(0)
+        cap_padding_len = (-cap_ori_len) % 32
+
+        cap_padded_pos_ids = self.create_coordinate_grid(
+            size=(cap_ori_len + cap_padding_len, 1, 1),
+            start=(1, 0, 0),
+            device=device,
+        ).flatten(0, 2)
+        all_cap_pos_ids.append(cap_padded_pos_ids)
+
+        all_cap_pad_mask.append(
+            torch.cat(
+                [
+                    torch.zeros((cap_ori_len,), dtype=torch.bool, device=device),
+                    torch.ones((cap_padding_len,), dtype=torch.bool, device=device),
+                ],
+                dim=0,
+            )
+        )
+
+        cap_padded_feat = torch.cat(
+            [cap_feat, cap_feat[-1:].repeat(cap_padding_len, 1)],
+            dim=0,
+        )
+        all_cap_feats_out.append(cap_padded_feat)
+
+        ### Process Image
+        C, F, H, W = image.size()
+        all_image_size.append((F, H, W))
+        F_tokens, H_tokens, W_tokens = F // pF, H // pH, W // pW
+
+        image = image.view(C, F_tokens, pF, H_tokens, pH, W_tokens, pW)
+        image = image.permute(1, 3, 5, 2, 4, 6, 0).reshape(F_tokens * H_tokens * W_tokens, pF * pH * pW * C)
+
+        image_ori_len = image.size(0)
+        image_padding_len = (-image_ori_len) % 32
+
+        image_ori_pos_ids = self.create_coordinate_grid(
+            size=(F_tokens, H_tokens, W_tokens),
+            start=(cap_ori_len + cap_padding_len + 1, 0, 0),
+            device=device,
+        ).flatten(0, 2)
+        image_padding_pos_ids = (
+            self.create_coordinate_grid(
+                size=(1, 1, 1),
+                start=(0, 0, 0),
+                device=device,
+            )
+            .flatten(0, 2)
+            .repeat(image_padding_len, 1)
+        )
+        image_padded_pos_ids = torch.cat([image_ori_pos_ids, image_padding_pos_ids], dim=0)
+        all_image_pos_ids.append(image_padded_pos_ids)
+
+        all_image_pad_mask.append(
+            torch.cat(
+                [
+                    torch.zeros((image_ori_len,), dtype=torch.bool, device=device),
+                    torch.ones((image_padding_len,), dtype=torch.bool, device=device),
+                ],
+                dim=0,
+            )
+        )
+
+        image_padded_feat = torch.cat([image, image[-1:].repeat(image_padding_len, 1)], dim=0)
+        all_image_out.append(image_padded_feat)
+
+    return (
+        all_image_out,
+        all_cap_feats_out,
+        all_image_size,
+        all_image_pos_ids,
+        all_cap_pos_ids,
+        all_image_pad_mask,
+        all_cap_pad_mask,
+    )
+
+
+class ZImageTransformerModelPatcher(ModelPatcher):
+    def __enter__(self):
+        super().__enter__()
+
+        from diffusers.models.transformers import transformer_z_image
+
+        self._orig_RopeEmbedder = transformer_z_image.RopeEmbedder
+        self._orig_ZSingleStreamAttnProcessor = transformer_z_image.ZSingleStreamAttnProcessor
+
+        class PatchedRopeEmbedder(self._orig_RopeEmbedder):
+            def __init__(
+                self_inner,
+                theta: float = 256.0,
+                axes_dims: List[int] = (16, 56, 56),
+                axes_lens: List[int] = (64, 128, 128),
+            ):
+                super(PatchedRopeEmbedder, self_inner).__init__(theta, axes_dims, axes_lens)
+                self_inner.freqs_cis = self_inner.precompute_freqs_cis(self_inner.axes_dims, self_inner.axes_lens, theta=self_inner.theta)
+
+            @staticmethod
+            def precompute_freqs_cis(dim, end, theta=256.0):
+                return _zimage_rope_embedder_precompute_freqs_cis(dim, end, theta)
+
+            def __call__(self_inner, ids):
+                return _zimage_rope_embedder_call(self_inner, ids)
+
+        class PatchedZSingleStreamAttnProcessor(self._orig_ZSingleStreamAttnProcessor):
+            def __call__(self_inner, attn, hidden_states, encoder_hidden_states=None,
+                         attention_mask=None, freqs_cis=None):
+                return _zimage_attn_processor_call(
+                    self_inner, attn, hidden_states, encoder_hidden_states,
+                    attention_mask, freqs_cis
+                )
+
+        transformer_z_image.RopeEmbedder = PatchedRopeEmbedder
+        transformer_z_image.ZSingleStreamAttnProcessor = PatchedZSingleStreamAttnProcessor
+
+        self._orig_rope_embedder = self._model.rope_embedder
+        self._model.rope_embedder = PatchedRopeEmbedder(
+            theta=self._model.rope_embedder.theta,
+            axes_dims=self._model.rope_embedder.axes_dims,
+            axes_lens=self._model.rope_embedder.axes_lens,
+        )
+
+        for layer in self._model.noise_refiner:
+            layer.attention._orig_processor = layer.attention.processor
+            layer.attention.processor = PatchedZSingleStreamAttnProcessor()
+        for layer in self._model.context_refiner:
+            layer.attention._orig_processor = layer.attention.processor
+            layer.attention.processor = PatchedZSingleStreamAttnProcessor()
+        for layer in self._model.layers:
+            layer.attention._orig_processor = layer.attention.processor
+            layer.attention.processor = PatchedZSingleStreamAttnProcessor()
+
+        self._orig_forward = self._model.forward
+        self._orig_patchify_and_embed = self._model.patchify_and_embed
+        self._model.forward = types.MethodType(_zimage_forward, self._model)
+        self._model.patchify_and_embed = types.MethodType(
+            _zimage_patchify_and_embed, self._model)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+
+        from diffusers.models.transformers import transformer_z_image
+
+        transformer_z_image.RopeEmbedder = self._orig_RopeEmbedder
+        transformer_z_image.ZSingleStreamAttnProcessor = self._orig_ZSingleStreamAttnProcessor
+
+        self._model.rope_embedder = self._orig_rope_embedder
+        self._model.forward = self._orig_forward
+        self._model.patchify_and_embed = self._orig_patchify_and_embed
+
+        for layer in self._model.noise_refiner:
+            layer.attention.processor = layer.attention._orig_processor
+        for layer in self._model.context_refiner:
+            layer.attention.processor = layer.attention._orig_processor
+        for layer in self._model.layers:
+            layer.attention.processor = layer.attention._orig_processor
+
+
+def _zimage_omni_patchify_and_embed(
+    self,
+    cond_image,
+    target_image,
+    cond_cap_feat,
+    target_cap_feat,
+    siglip_feat,
+    patch_size: int,
+    f_patch_size: int,
+):
+    """
+    Patchify for omni mode: 1 condition image + 1 target image.
+    Returns all processed components for building the unified sequence.
+    """
+    pH = pW = patch_size
+    pF = f_patch_size
+    device = target_image.device
+    SEQ_MULTI = 32
+
+    def _patchify_single(image):
+        C, F, H, W = image.size()
+        F_t, H_t, W_t = F // pF, H // pH, W // pW
+        image = image.view(C, F_t, pF, H_t, pH, W_t, pW)
+        image = image.permute(1, 3, 5, 2, 4, 6, 0).reshape(F_t * H_t * W_t, pF * pH * pW * C)
+        return image, (F, H, W), (F_t, H_t, W_t)
+
+    def _pad_feat(feat, pad_len):
+        if pad_len > 0:
+            return torch.cat([feat, feat[-1:].expand(pad_len, -1)], dim=0)
+        return feat
+
+    # Process condition caption (noise_val=0 for clean)
+    cond_cap_ori_len = cond_cap_feat.size(0)
+    cond_cap_pad_len = (-cond_cap_ori_len) % SEQ_MULTI
+    cond_cap_total = cond_cap_ori_len + cond_cap_pad_len
+    cond_cap_padded = _pad_feat(cond_cap_feat, cond_cap_pad_len)
+    cond_cap_pos = self.create_coordinate_grid(
+        size=(cond_cap_total, 1, 1), start=(1, 0, 0), device=device
+    ).flatten(0, 2)
+    cond_cap_mask = torch.cat([
+        torch.zeros(cond_cap_ori_len, dtype=torch.bool, device=device),
+        torch.ones(cond_cap_pad_len, dtype=torch.bool, device=device),
+    ])
+    cond_cap_noise = torch.zeros(cond_cap_total, dtype=torch.long, device=device)
+
+    # Process target caption (noise_val=1 for noisy)
+    target_cap_ori_len = target_cap_feat.size(0)
+    target_cap_pad_len = (-target_cap_ori_len) % SEQ_MULTI
+    target_cap_total = target_cap_ori_len + target_cap_pad_len
+    target_cap_padded = _pad_feat(target_cap_feat, target_cap_pad_len)
+    target_cap_start = cond_cap_ori_len + 2  # skip padding for image/siglip
+    target_cap_pos = self.create_coordinate_grid(
+        size=(target_cap_total, 1, 1), start=(target_cap_start, 0, 0), device=device
+    ).flatten(0, 2)
+    target_cap_mask = torch.cat([
+        torch.zeros(target_cap_ori_len, dtype=torch.bool, device=device),
+        torch.ones(target_cap_pad_len, dtype=torch.bool, device=device),
+    ])
+    target_cap_noise = torch.ones(target_cap_total, dtype=torch.long, device=device)
+
+    # Concatenate caption data
+    all_cap = torch.cat([cond_cap_padded, target_cap_padded], dim=0)
+    all_cap_pos = torch.cat([cond_cap_pos, target_cap_pos], dim=0)
+    all_cap_mask = torch.cat([cond_cap_mask, target_cap_mask], dim=0)
+    all_cap_noise = torch.cat([cond_cap_noise, target_cap_noise], dim=0)
+
+    cap_lens = [cond_cap_total, target_cap_total]
+    cap_end_pos = [cond_cap_ori_len + 1, target_cap_start + target_cap_ori_len + 1]
+
+    # Process condition image (noise_val=0)
+    cond_patches, cond_size, (cF_t, cH_t, cW_t) = _patchify_single(cond_image)
+    cond_x_ori_len = cond_patches.size(0)
+    cond_x_pad_len = (-cond_x_ori_len) % SEQ_MULTI
+    cond_x_total = cond_x_ori_len + cond_x_pad_len
+    cond_x_padded = _pad_feat(cond_patches, cond_x_pad_len)
+    cond_x_pos = self.create_coordinate_grid(
+        size=(cF_t, cH_t, cW_t), start=(cap_end_pos[0], 0, 0), device=device
+    ).flatten(0, 2)
+    cond_x_pad_pos = self.create_coordinate_grid(
+        size=(1, 1, 1), start=(0, 0, 0), device=device
+    ).flatten(0, 2).expand(cond_x_pad_len, -1)
+    cond_x_pos_all = torch.cat([cond_x_pos, cond_x_pad_pos], dim=0)
+    cond_x_mask = torch.cat([
+        torch.zeros(cond_x_ori_len, dtype=torch.bool, device=device),
+        torch.ones(cond_x_pad_len, dtype=torch.bool, device=device),
+    ])
+    cond_x_noise = torch.zeros(cond_x_total, dtype=torch.long, device=device)
+
+    # Process target image (noise_val=1)
+    target_patches, target_size, (tF_t, tH_t, tW_t) = _patchify_single(target_image)
+    target_x_ori_len = target_patches.size(0)
+    target_x_pad_len = (-target_x_ori_len) % SEQ_MULTI
+    target_x_total = target_x_ori_len + target_x_pad_len
+    target_x_padded = _pad_feat(target_patches, target_x_pad_len)
+    target_x_pos = self.create_coordinate_grid(
+        size=(tF_t, tH_t, tW_t), start=(cap_end_pos[1], 0, 0), device=device
+    ).flatten(0, 2)
+    target_x_pad_pos = self.create_coordinate_grid(
+        size=(1, 1, 1), start=(0, 0, 0), device=device
+    ).flatten(0, 2).expand(target_x_pad_len, -1)
+    target_x_pos_all = torch.cat([target_x_pos, target_x_pad_pos], dim=0)
+    target_x_mask = torch.cat([
+        torch.zeros(target_x_ori_len, dtype=torch.bool, device=device),
+        torch.ones(target_x_pad_len, dtype=torch.bool, device=device),
+    ])
+    target_x_noise = torch.ones(target_x_total, dtype=torch.long, device=device)
+
+    # Concatenate image data
+    all_x = torch.cat([cond_x_padded, target_x_padded], dim=0)
+    all_x_pos = torch.cat([cond_x_pos_all, target_x_pos_all], dim=0)
+    all_x_mask = torch.cat([cond_x_mask, target_x_mask], dim=0)
+    all_x_noise = torch.cat([cond_x_noise, target_x_noise], dim=0)
+    x_lens = [cond_x_total, target_x_total]
+
+    # Process siglip (noise_val=0 for condition, with None for target)
+    sig_H, sig_W, sig_C = siglip_feat.size()
+    sig_flat = siglip_feat.permute(2, 0, 1).reshape(sig_H * sig_W, sig_C)
+    sig_ori_len = sig_flat.size(0)
+    sig_pad_len = (-sig_ori_len) % SEQ_MULTI
+    sig_total = sig_ori_len + sig_pad_len
+    sig_padded = _pad_feat(sig_flat, sig_pad_len)
+    sig_pos = self.create_coordinate_grid(
+        size=(1, sig_H, sig_W), start=(cap_end_pos[0] + 1, 0, 0), device=device
+    ).flatten(0, 2)
+    # Scale siglip pos to match condition image resolution
+    sig_pos = sig_pos.float()
+    sig_pos[..., 1] = sig_pos[..., 1] / max(sig_H - 1, 1) * max(cond_size[1] - 1, 1)
+    sig_pos[..., 2] = sig_pos[..., 2] / max(sig_W - 1, 1) * max(cond_size[2] - 1, 1)
+    sig_pos = sig_pos.to(torch.int32)
+    sig_pad_pos = self.create_coordinate_grid(
+        size=(1, 1, 1), start=(0, 0, 0), device=device
+    ).flatten(0, 2).expand(sig_pad_len, -1)
+    sig_pos_all = torch.cat([sig_pos, sig_pad_pos], dim=0)
+    sig_mask = torch.cat([
+        torch.zeros(sig_ori_len, dtype=torch.bool, device=device),
+        torch.ones(sig_pad_len, dtype=torch.bool, device=device),
+    ])
+    sig_noise = torch.zeros(sig_total, dtype=torch.long, device=device)
+
+    # For target siglip: just padding (None siglip)
+    target_sig_total = SEQ_MULTI
+    target_sig_padded = torch.zeros((target_sig_total, sig_C), dtype=siglip_feat.dtype, device=device)
+    target_sig_pos = self.create_coordinate_grid(
+        size=(1, 1, 1), start=(0, 0, 0), device=device
+    ).flatten(0, 2).expand(target_sig_total, -1)
+    target_sig_mask = torch.ones(target_sig_total, dtype=torch.bool, device=device)
+    target_sig_noise = torch.ones(target_sig_total, dtype=torch.long, device=device)
+
+    all_sig = torch.cat([sig_padded, target_sig_padded], dim=0)
+    all_sig_pos = torch.cat([sig_pos_all, target_sig_pos], dim=0)
+    all_sig_mask = torch.cat([sig_mask, target_sig_mask], dim=0)
+    all_sig_noise = torch.cat([sig_noise, target_sig_noise], dim=0)
+    sig_lens = [sig_total, target_sig_total]
+
+    # Compute x position offsets for unpatchify
+    cap_total_len = sum(cap_lens)
+    x_total_len = sum(x_lens)
+    x_pos_offset = (cap_total_len, cap_total_len + x_total_len)
+
+    return {
+        "all_x": all_x, "all_x_pos": all_x_pos, "all_x_mask": all_x_mask,
+        "all_x_noise": all_x_noise, "x_lens": x_lens,
+        "all_cap": all_cap, "all_cap_pos": all_cap_pos, "all_cap_mask": all_cap_mask,
+        "all_cap_noise": all_cap_noise, "cap_lens": cap_lens,
+        "all_sig": all_sig, "all_sig_pos": all_sig_pos, "all_sig_mask": all_sig_mask,
+        "all_sig_noise": all_sig_noise, "sig_lens": sig_lens,
+        "x_pos_offset": x_pos_offset,
+        "cond_size": cond_size, "target_size": target_size,
+    }
+
+
+def _zimage_omni_forward(
+    self,
+    hidden_states,
+    timestep,
+    encoder_hidden_states,
+    condition_hidden_states,
+    condition_encoder_hidden_states,
+    siglip_hidden_states,
+) -> torch.Tensor:
+    """
+    Omni-mode forward for Z-Image transformer.
+    Handles 1 condition image + 1 target image with siglip features.
+    """
+    patch_size = 2
+    f_patch_size = 1
+
+    # For batch_size=1 (typical export/inference case)
+    target_image = hidden_states[0]    # [C, 1, H, W]
+    cond_image = condition_hidden_states[0]  # [C, 1, H_c, W_c]
+    target_cap = encoder_hidden_states[0]    # [seq_len, cap_dim]
+    cond_cap = condition_encoder_hidden_states[0]  # [seq_len, cap_dim]
+    siglip_feat = siglip_hidden_states[0]    # [sig_seq_len, sig_dim]
+
+    bsz = 1
+    device = target_image.device
+
+    # Dual timestep embeddings
+    t_noisy = self.t_embedder(timestep * self.t_scale).type_as(target_image)
+    t_clean = self.t_embedder(torch.ones_like(timestep) * self.t_scale).type_as(target_image)
+
+    # Reshape siglip from [seq_len, dim] to [H, W, dim] (assume square)
+    sig_seq_len = siglip_feat.size(0)
+    sig_h = int(sig_seq_len ** 0.5)
+    sig_w = sig_seq_len // sig_h
+    siglip_feat_3d = siglip_feat.view(sig_h, sig_w, -1)
+
+    # Patchify and embed
+    data = _zimage_omni_patchify_and_embed(
+        self, cond_image, target_image, cond_cap, target_cap, siglip_feat_3d,
+        patch_size, f_patch_size
+    )
+
+    # X embed & refine
+    x_all = data["all_x"]
+    x_total_len = x_all.size(0)
+    x_embedded = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](x_all)
+    x_flat_mask = data["all_x_mask"]
+    x_embedded = torch.where(x_flat_mask.unsqueeze(-1), self.x_pad_token, x_embedded)
+    x_freqs = self.rope_embedder(data["all_x_pos"])
+    x_embedded = x_embedded.unsqueeze(0)  # [1, seq, dim]
+    x_freqs = x_freqs.unsqueeze(0)
+    x_noise = data["all_x_noise"].unsqueeze(0)
+    x_attn_mask = (~x_flat_mask).unsqueeze(0)  # [1, seq] True where valid
+
+    for layer in self.noise_refiner:
+        x_embedded = layer(x_embedded, x_attn_mask, x_freqs, noise_mask=x_noise,
+                          adaln_noisy=t_noisy, adaln_clean=t_clean)
+
+    # Cap embed & refine
+    cap_all = data["all_cap"]
+    cap_embedded = self.cap_embedder(cap_all)
+    cap_flat_mask = data["all_cap_mask"]
+    cap_embedded = torch.where(cap_flat_mask.unsqueeze(-1), self.cap_pad_token, cap_embedded)
+    cap_freqs = self.rope_embedder(data["all_cap_pos"])
+    cap_embedded = cap_embedded.unsqueeze(0)
+    cap_freqs = cap_freqs.unsqueeze(0)
+    cap_attn_mask = (~cap_flat_mask).unsqueeze(0)
+
+    for layer in self.context_refiner:
+        cap_embedded = layer(cap_embedded, cap_attn_mask, cap_freqs)
+
+    # Siglip embed & refine
+    sig_all = data["all_sig"]
+    sig_embedded = self.siglip_embedder(sig_all)
+    sig_flat_mask = data["all_sig_mask"]
+    sig_embedded = torch.where(sig_flat_mask.unsqueeze(-1), self.siglip_pad_token, sig_embedded)
+    sig_freqs = self.rope_embedder(data["all_sig_pos"])
+    sig_embedded = sig_embedded.unsqueeze(0)
+    sig_freqs = sig_freqs.unsqueeze(0)
+    sig_attn_mask = (~sig_flat_mask).unsqueeze(0)
+
+    for layer in self.siglip_refiner:
+        sig_embedded = layer(sig_embedded, sig_attn_mask, sig_freqs)
+
+    # Build unified sequence: [cap, x, siglip] for omni mode
+    cap_len = cap_embedded.size(1)
+    x_len = x_embedded.size(1)
+    sig_len = sig_embedded.size(1)
+
+    unified = torch.cat([cap_embedded[0, :cap_len], x_embedded[0, :x_len], sig_embedded[0, :sig_len]], dim=0)
+    unified_freqs = torch.cat([cap_freqs[0, :cap_len], x_freqs[0, :x_len], sig_freqs[0, :sig_len]], dim=0)
+    unified_noise = torch.cat([data["all_cap_noise"], data["all_x_noise"], data["all_sig_noise"]], dim=0)
+    unified_mask_flat = torch.cat([cap_attn_mask[0], x_attn_mask[0], sig_attn_mask[0]], dim=0)
+
+    unified = unified.unsqueeze(0)  # [1, total_seq, dim]
+    unified_freqs = unified_freqs.unsqueeze(0)
+    unified_noise = unified_noise.unsqueeze(0)
+    unified_attn_mask = unified_mask_flat.unsqueeze(0)
+
+    # Main transformer layers
+    for layer in self.layers:
+        unified = layer(unified, unified_attn_mask, unified_freqs,
+                       noise_mask=unified_noise, adaln_noisy=t_noisy, adaln_clean=t_clean)
+
+    # Final layer with per-token modulation
+    unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](
+        unified, noise_mask=unified_noise, c_noisy=t_noisy, c_clean=t_clean
+    )
+
+    # Extract target image from output - the x section starts at cap_len
+    x_pos_offset = data["x_pos_offset"]
+    x_start = x_pos_offset[0]
+    x_end = x_pos_offset[1]
+    target_offset = data["x_lens"][0]  # skip condition patches
+    target_len = data["x_lens"][1]
+
+    # Get target output tokens
+    target_x = unified[0, x_start + target_offset: x_start + target_offset + target_len]
+
+    # Unpatchify target
+    tF, tH, tW = data["target_size"]
+    tF_t = tF // f_patch_size
+    tH_t = tH // patch_size
+    tW_t = tW // patch_size
+    ori_len = tF_t * tH_t * tW_t
+    result = (
+        target_x[:ori_len]
+        .view(tF_t, tH_t, tW_t, f_patch_size, patch_size, patch_size, self.out_channels)
+        .permute(6, 0, 3, 1, 4, 2, 5)
+        .reshape(self.out_channels, tF, tH, tW)
+    )
+
+    return result
+
+
+class ZImageOmniTransformerModelPatcher(ModelPatcher):
+    def __enter__(self):
+        super().__enter__()
+
+        from diffusers.models.transformers import transformer_z_image
+
+        self._orig_RopeEmbedder = transformer_z_image.RopeEmbedder
+        self._orig_ZSingleStreamAttnProcessor = transformer_z_image.ZSingleStreamAttnProcessor
+
+        class PatchedRopeEmbedder(self._orig_RopeEmbedder):
+            def __init__(
+                self_inner,
+                theta: float = 256.0,
+                axes_dims: List[int] = (16, 56, 56),
+                axes_lens: List[int] = (64, 128, 128),
+            ):
+                super(PatchedRopeEmbedder, self_inner).__init__(theta, axes_dims, axes_lens)
+                self_inner.freqs_cis = self_inner.precompute_freqs_cis(self_inner.axes_dims, self_inner.axes_lens, theta=self_inner.theta)
+
+            @staticmethod
+            def precompute_freqs_cis(dim, end, theta=256.0):
+                return _zimage_rope_embedder_precompute_freqs_cis(dim, end, theta)
+
+            def __call__(self_inner, ids):
+                return _zimage_rope_embedder_call(self_inner, ids)
+
+        class PatchedZSingleStreamAttnProcessor(self._orig_ZSingleStreamAttnProcessor):
+            def __call__(self_inner, attn, hidden_states, encoder_hidden_states=None,
+                         attention_mask=None, freqs_cis=None):
+                return _zimage_attn_processor_call(
+                    self_inner, attn, hidden_states, encoder_hidden_states,
+                    attention_mask, freqs_cis
+                )
+
+        transformer_z_image.RopeEmbedder = PatchedRopeEmbedder
+        transformer_z_image.ZSingleStreamAttnProcessor = PatchedZSingleStreamAttnProcessor
+
+        self._orig_rope_embedder = self._model.rope_embedder
+        self._model.rope_embedder = PatchedRopeEmbedder(
+            theta=self._model.rope_embedder.theta,
+            axes_dims=self._model.rope_embedder.axes_dims,
+            axes_lens=self._model.rope_embedder.axes_lens,
+        )
+
+        for layer in self._model.noise_refiner:
+            layer.attention._orig_processor = layer.attention.processor
+            layer.attention.processor = PatchedZSingleStreamAttnProcessor()
+        for layer in self._model.context_refiner:
+            layer.attention._orig_processor = layer.attention.processor
+            layer.attention.processor = PatchedZSingleStreamAttnProcessor()
+        for layer in self._model.layers:
+            layer.attention._orig_processor = layer.attention.processor
+            layer.attention.processor = PatchedZSingleStreamAttnProcessor()
+        if self._model.siglip_refiner is not None:
+            for layer in self._model.siglip_refiner:
+                layer.attention._orig_processor = layer.attention.processor
+                layer.attention.processor = PatchedZSingleStreamAttnProcessor()
+
+        self._orig_forward = self._model.forward
+        self._model.forward = types.MethodType(_zimage_omni_forward, self._model)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+
+        from diffusers.models.transformers import transformer_z_image
+
+        transformer_z_image.RopeEmbedder = self._orig_RopeEmbedder
+        transformer_z_image.ZSingleStreamAttnProcessor = self._orig_ZSingleStreamAttnProcessor
+
+        self._model.rope_embedder = self._orig_rope_embedder
+        self._model.forward = self._orig_forward
+
+        for layer in self._model.noise_refiner:
+            layer.attention.processor = layer.attention._orig_processor
+        for layer in self._model.context_refiner:
+            layer.attention.processor = layer.attention._orig_processor
+        for layer in self._model.layers:
+            layer.attention.processor = layer.attention._orig_processor
+        if self._model.siglip_refiner is not None:
+            for layer in self._model.siglip_refiner:
+                layer.attention.processor = layer.attention._orig_processor

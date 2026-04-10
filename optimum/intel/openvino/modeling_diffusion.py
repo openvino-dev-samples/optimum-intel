@@ -126,8 +126,19 @@ if is_diffusers_version(">=", "0.35.0"):
 else:
     CacheMixin = object
 
+try:
+    from diffusers import ZImagePipeline
+except ImportError:
+    ZImagePipeline = object
+
+try:
+    from diffusers import ZImageOmniPipeline
+except ImportError:
+    ZImageOmniPipeline = object
+
 DIFFUSION_MODEL_TRANSFORMER_SUBFOLDER = "transformer"
 DIFFUSION_MODEL_TEXT_ENCODER_3_SUBFOLDER = "text_encoder_3"
+DIFFUSION_MODEL_SIGLIP_SUBFOLDER = "siglip"
 
 core = Core()
 
@@ -152,6 +163,7 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
             "text_encoder": os.path.join(DIFFUSION_MODEL_TEXT_ENCODER_SUBFOLDER, OV_XML_FILE_NAME),
             "text_encoder_2": os.path.join(DIFFUSION_MODEL_TEXT_ENCODER_2_SUBFOLDER, OV_XML_FILE_NAME),
             "text_encoder_3": os.path.join(DIFFUSION_MODEL_TEXT_ENCODER_3_SUBFOLDER, OV_XML_FILE_NAME),
+            "siglip": os.path.join(DIFFUSION_MODEL_SIGLIP_SUBFOLDER, OV_XML_FILE_NAME),
         }
         return models_paths
 
@@ -166,6 +178,7 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
         text_encoder_2: Optional[openvino.Model] = None,
         text_encoder_3: Optional[openvino.Model] = None,
         transformer: Optional[openvino.Model] = None,
+        siglip: Optional[openvino.Model] = None,
         # optional pipeline submodels
         tokenizer: Optional[CLIPTokenizer] = None,
         tokenizer_2: Optional[CLIPTokenizer] = None,
@@ -242,6 +255,11 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
             if text_encoder_3 is not None
             else None
         )
+        self.siglip = (
+            OVModelTextEncoder(siglip, self, DIFFUSION_MODEL_SIGLIP_SUBFOLDER)
+            if siglip is not None
+            else None
+        )
         # We wrap the VAE Decoder & Encoder in a single object to simulate diffusers API
         self.vae = OVModelVae(decoder=self.vae_decoder, encoder=self.vae_encoder)
 
@@ -254,6 +272,7 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
         # we allow passing these as torch models for now
         self.image_encoder = kwargs.pop("image_encoder", None)  # TODO: maybe mplement OVModelImageEncoder
         self.safety_checker = kwargs.pop("safety_checker", None)  # TODO: maybe mplement OVModelSafetyChecker
+        self.siglip_processor = kwargs.pop("siglip_processor", None)
 
         all_pipeline_init_args = {
             "vae": self.vae,
@@ -262,8 +281,10 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
             "text_encoder": self.text_encoder,
             "text_encoder_2": self.text_encoder_2,
             "text_encoder_3": self.text_encoder_3,
+            "siglip": self.siglip,
             "safety_checker": self.safety_checker,
             "image_encoder": self.image_encoder,
+            "siglip_processor": self.siglip_processor,
             "scheduler": self.scheduler,
             "tokenizer": self.tokenizer,
             "tokenizer_2": self.tokenizer_2,
@@ -358,6 +379,8 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
             self.feature_extractor.save_pretrained(save_directory / "feature_extractor")
         if getattr(self, "safety_checker", None) is not None:
             self.safety_checker.save_pretrained(save_directory / "safety_checker")
+        if getattr(self, "siglip_processor", None) is not None:
+            self.siglip_processor.save_pretrained(save_directory / "siglip_processor")
 
         self._save_openvino_config(save_directory)
 
@@ -423,6 +446,7 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
             "text_encoder_2": text_encoder_2_file_name or default_file_name,
             "text_encoder_3": text_encoder_3_file_name or default_file_name,
             "transformer": transformer_file_name or default_file_name,
+            "siglip": default_file_name,
         }
 
         if not os.path.isdir(str(model_id)):
@@ -468,6 +492,7 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
             "feature_extractor": None,
             "safety_checker": None,
             "image_encoder": None,
+            "siglip_processor": None,
         }
         for name in submodels.keys():
             if name in kwargs:
@@ -1663,6 +1688,600 @@ class OVLTXPipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, LTXPipel
     auto_model_class = LTXPipeline
 
 
+class OVZImagePipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, ZImagePipeline):
+    main_input_name = "prompt"
+    export_feature = "text-to-image"
+    auto_model_class = ZImagePipeline
+
+    def reshape(self, batch_size: int, height: int, width: int, num_images_per_prompt: int = -1, num_frames: int = -1):
+        # Z-Image transformer uses 5D inputs with hardcoded spatial reshapes from tracing.
+        # Only reshape the text_encoder (dynamic seq_len); keep transformer and VAE static.
+        self.is_dynamic = False
+        if self.text_encoder is not None:
+            self._reshape_text_encoder(self.text_encoder.model, batch_size=-1, tokenizer_max_length=-1)
+        return self
+
+    def _call_ov_transformer(self, x_list, t, cap_feats_list):
+        """Call OV transformer per-batch-item (model was traced with batch=1)."""
+        self.transformer.compile()
+        results = []
+        for i in range(len(x_list)):
+            hidden_states = x_list[i].unsqueeze(0).to(torch.float32)
+            encoder_hidden_states = cap_feats_list[i].unsqueeze(0).to(torch.float32)
+            timestep = t[i:i+1].to(torch.float32)
+
+            model_inputs = {
+                "hidden_states": hidden_states,
+                "encoder_hidden_states": encoder_hidden_states,
+                "timestep": timestep,
+            }
+            ov_outputs = self.transformer.request(model_inputs, share_inputs=True).to_dict()
+            result_tensor = torch.from_numpy(next(iter(ov_outputs.values())))
+            results.append(result_tensor)
+        return results
+
+    def _encode_prompt(self, prompt, device=None, prompt_embeds=None, max_sequence_length=512):
+        """Encode prompt using OV text encoder. Returns list of per-prompt embeddings."""
+        device = device or self._execution_device
+
+        if prompt_embeds is not None:
+            return prompt_embeds
+
+        if isinstance(prompt, str):
+            prompt = [prompt]
+
+        for i, prompt_item in enumerate(prompt):
+            messages = [{"role": "user", "content": prompt_item}]
+            prompt[i] = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=True,
+            )
+
+        text_inputs = self.tokenizer(
+            prompt, padding="max_length", max_length=max_sequence_length,
+            truncation=True, return_tensors="pt",
+        )
+
+        text_input_ids = text_inputs.input_ids.to(device)
+        prompt_masks = text_inputs.attention_mask.to(device).bool()
+
+        # OV text encoder outputs hidden_states[-2] as last_hidden_state
+        te_output = self.text_encoder(
+            input_ids=text_input_ids, attention_mask=prompt_masks,
+        )
+        prompt_embeds = te_output.last_hidden_state
+
+        embeddings_list = []
+        for i in range(len(prompt_embeds)):
+            embeddings_list.append(prompt_embeds[i][prompt_masks[i]])
+
+        return embeddings_list
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        prompt=None,
+        height=None,
+        width=None,
+        num_inference_steps=50,
+        sigmas=None,
+        guidance_scale=5.0,
+        cfg_normalization=False,
+        cfg_truncation=1.0,
+        negative_prompt=None,
+        num_images_per_prompt=1,
+        generator=None,
+        latents=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
+        output_type="pil",
+        return_dict=True,
+        joint_attention_kwargs=None,
+        callback_on_step_end=None,
+        callback_on_step_end_tensor_inputs=None,
+        max_sequence_length=512,
+    ):
+        from diffusers.pipelines.z_image.pipeline_z_image import calculate_shift, retrieve_timesteps
+        from diffusers.pipelines.z_image.pipeline_output import ZImagePipelineOutput
+
+        height = height or 1024
+        width = width or 1024
+
+        vae_scale = self.vae_scale_factor * 2
+        if height % vae_scale != 0:
+            raise ValueError(f"Height must be divisible by {vae_scale} (got {height}).")
+        if width % vae_scale != 0:
+            raise ValueError(f"Width must be divisible by {vae_scale} (got {width}).")
+
+        device = self._execution_device
+
+        self._guidance_scale = guidance_scale
+        self._joint_attention_kwargs = joint_attention_kwargs
+        self._interrupt = False
+        self._cfg_normalization = cfg_normalization
+        self._cfg_truncation = cfg_truncation
+
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
+        else:
+            batch_size = len(prompt_embeds)
+
+        if prompt_embeds is None or prompt is not None:
+            prompt_embeds = self._encode_prompt(
+                prompt=prompt, device=device, max_sequence_length=max_sequence_length,
+            )
+            if self.do_classifier_free_guidance:
+                negative_prompt_embeds = self._encode_prompt(
+                    prompt=negative_prompt or [""] * batch_size, device=device,
+                    max_sequence_length=max_sequence_length,
+                )
+            else:
+                negative_prompt_embeds = []
+
+        num_channels_latents = self.transformer.config.get("in_channels", 16)
+
+        latents = self.prepare_latents(
+            batch_size * num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            torch.float32,
+            device,
+            generator,
+            latents,
+        )
+
+        if num_images_per_prompt > 1:
+            prompt_embeds = [pe for pe in prompt_embeds for _ in range(num_images_per_prompt)]
+            if self.do_classifier_free_guidance and negative_prompt_embeds:
+                negative_prompt_embeds = [npe for npe in negative_prompt_embeds for _ in range(num_images_per_prompt)]
+
+        actual_batch_size = batch_size * num_images_per_prompt
+        image_seq_len = (latents.shape[2] // 2) * (latents.shape[3] // 2)
+
+        mu = calculate_shift(
+            image_seq_len,
+            self.scheduler.config.get("base_image_seq_len", 256),
+            self.scheduler.config.get("max_image_seq_len", 4096),
+            self.scheduler.config.get("base_shift", 0.5),
+            self.scheduler.config.get("max_shift", 1.15),
+        )
+        self.scheduler.sigma_min = 0.0
+        timesteps, num_inference_steps = retrieve_timesteps(
+            self.scheduler, num_inference_steps, device, sigmas=sigmas, mu=mu,
+        )
+        num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
+        self._num_timesteps = len(timesteps)
+
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for i, t in enumerate(timesteps):
+                if self.interrupt:
+                    continue
+
+                timestep = t.expand(latents.shape[0])
+                timestep = (1000 - timestep) / 1000
+                t_norm = timestep[0].item()
+
+                current_guidance_scale = self.guidance_scale
+                if (
+                    self.do_classifier_free_guidance
+                    and self._cfg_truncation is not None
+                    and float(self._cfg_truncation) <= 1
+                ):
+                    if t_norm > self._cfg_truncation:
+                        current_guidance_scale = 0.0
+
+                apply_cfg = self.do_classifier_free_guidance and current_guidance_scale > 0
+
+                if apply_cfg:
+                    latent_model_input = latents.repeat(2, 1, 1, 1)
+                    prompt_embeds_input = prompt_embeds + negative_prompt_embeds
+                    timestep_input = timestep.repeat(2)
+                else:
+                    latent_model_input = latents
+                    prompt_embeds_input = prompt_embeds
+                    timestep_input = timestep
+
+                latent_model_input = latent_model_input.unsqueeze(2)
+                x_list = list(latent_model_input.unbind(dim=0))
+
+                model_out_list = self._call_ov_transformer(x_list, timestep_input, prompt_embeds_input)
+
+                if apply_cfg:
+                    pos_out = model_out_list[:actual_batch_size]
+                    neg_out = model_out_list[actual_batch_size:]
+
+                    noise_pred = []
+                    for j in range(actual_batch_size):
+                        pos = pos_out[j].float()
+                        neg = neg_out[j].float()
+                        pred = pos + current_guidance_scale * (pos - neg)
+                        if self._cfg_normalization and float(self._cfg_normalization) > 0.0:
+                            ori_pos_norm = torch.linalg.vector_norm(pos)
+                            new_pos_norm = torch.linalg.vector_norm(pred)
+                            max_new_norm = ori_pos_norm * float(self._cfg_normalization)
+                            if new_pos_norm > max_new_norm:
+                                pred = pred * (max_new_norm / new_pos_norm)
+                        noise_pred.append(pred)
+                    noise_pred = torch.stack(noise_pred, dim=0)
+                else:
+                    noise_pred = torch.stack([item.float() for item in model_out_list], dim=0)
+
+                noise_pred = noise_pred.squeeze(2)
+                noise_pred = -noise_pred
+
+                latents = self.scheduler.step(noise_pred.to(torch.float32), t, latents, return_dict=False)[0]
+
+                if callback_on_step_end is not None:
+                    callback_kwargs = {}
+                    for k in (callback_on_step_end_tensor_inputs or []):
+                        callback_kwargs[k] = locals()[k]
+                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+                    latents = callback_outputs.pop("latents", latents)
+                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+                    negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                    progress_bar.update()
+
+        if output_type == "latent":
+            image = latents
+        else:
+            latents = latents.to(self.vae.dtype)
+            latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+            image = self.vae.decode(latents, return_dict=False)[0]
+            image = self.image_processor.postprocess(image, output_type=output_type)
+
+        self.maybe_free_model_hooks()
+
+        if not return_dict:
+            return (image,)
+        return ZImagePipelineOutput(images=image)
+
+
+class OVZImageOmniPipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, ZImageOmniPipeline):
+    main_input_name = "prompt"
+    export_feature = "text-to-image"
+    auto_model_class = ZImageOmniPipeline
+
+    def reshape(self, batch_size: int, height: int, width: int, num_images_per_prompt: int = -1, num_frames: int = -1):
+        self.is_dynamic = False
+        if self.text_encoder is not None:
+            self._reshape_text_encoder(self.text_encoder.model, batch_size=-1, tokenizer_max_length=-1)
+        return self
+
+    def _encode_prompt(self, prompt, device=None, prompt_embeds=None, max_sequence_length=512, num_condition_images=0):
+        """Encode prompt for Omni mode. Returns list of list[Tensor] per batch item."""
+        device = device or self._execution_device
+
+        if prompt_embeds is not None:
+            return prompt_embeds
+
+        if isinstance(prompt, str):
+            prompt = [prompt]
+
+        for i, prompt_item in enumerate(prompt):
+            if num_condition_images == 0:
+                prompt[i] = ["<|im_start|>user\n" + prompt_item + "<|im_end|>\n<|im_start|>assistant\n"]
+            elif num_condition_images > 0:
+                prompt_list = ["<|im_start|>user\n<|vision_start|>"]
+                prompt_list += ["<|vision_end|><|vision_start|>"] * (num_condition_images - 1)
+                prompt_list += ["<|vision_end|>" + prompt_item + "<|im_end|>\n<|im_start|>assistant\n<|vision_start|>"]
+                prompt_list += ["<|vision_end|><|im_end|>"]
+                prompt[i] = prompt_list
+
+        flattened_prompt = []
+        prompt_list_lengths = []
+        for i in range(len(prompt)):
+            prompt_list_lengths.append(len(prompt[i]))
+            flattened_prompt.extend(prompt[i])
+
+        text_inputs = self.tokenizer(
+            flattened_prompt, padding="max_length", max_length=max_sequence_length,
+            truncation=True, return_tensors="pt",
+        )
+        text_input_ids = text_inputs.input_ids.to(device)
+        prompt_masks = text_inputs.attention_mask.to(device).bool()
+
+        te_output = self.text_encoder(input_ids=text_input_ids, attention_mask=prompt_masks)
+        all_embeds = te_output.last_hidden_state
+
+        embeddings_list = []
+        start_idx = 0
+        for i in range(len(prompt_list_lengths)):
+            batch_embeddings = []
+            end_idx = start_idx + prompt_list_lengths[i]
+            for j in range(start_idx, end_idx):
+                batch_embeddings.append(all_embeds[j][prompt_masks[j]])
+            embeddings_list.append(batch_embeddings)
+            start_idx = end_idx
+
+        return embeddings_list
+
+    def _call_ov_siglip(self, siglip_inputs):
+        """Call OV siglip model with all required inputs from processor output."""
+        self.siglip.compile()
+        model_inputs = {}
+        for key in ["pixel_values", "pixel_attention_mask", "spatial_shapes"]:
+            if hasattr(siglip_inputs, key):
+                val = getattr(siglip_inputs, key)
+                if isinstance(val, torch.Tensor):
+                    model_inputs[key] = val.to(torch.float32) if val.is_floating_point() else val
+                else:
+                    model_inputs[key] = val
+            elif isinstance(siglip_inputs, dict) and key in siglip_inputs:
+                val = siglip_inputs[key]
+                if isinstance(val, torch.Tensor):
+                    model_inputs[key] = val.to(torch.float32) if val.is_floating_point() else val
+                else:
+                    model_inputs[key] = val
+        ov_outputs = self.siglip.request(model_inputs, share_inputs=True).to_dict()
+        return torch.from_numpy(next(iter(ov_outputs.values())))
+
+    def _call_ov_transformer_omni(self, hidden_states, timestep, encoder_hidden_states,
+                                   condition_hidden_states, condition_encoder_hidden_states,
+                                   siglip_hidden_states):
+        """Call OV transformer in omni mode. All inputs should already be [1, ...] tensors."""
+        self.transformer.compile()
+        model_inputs = {
+            "hidden_states": hidden_states.to(torch.float32).contiguous(),
+            "encoder_hidden_states": encoder_hidden_states.to(torch.float32).contiguous(),
+            "timestep": timestep.to(torch.float32).contiguous(),
+            "condition_hidden_states": condition_hidden_states.to(torch.float32).contiguous(),
+            "condition_encoder_hidden_states": condition_encoder_hidden_states.to(torch.float32).contiguous(),
+            "siglip_hidden_states": siglip_hidden_states.to(torch.float32).contiguous(),
+        }
+        ov_outputs = self.transformer.request(model_inputs, share_inputs=True).to_dict()
+        return torch.from_numpy(next(iter(ov_outputs.values())))
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        image=None,
+        prompt=None,
+        height=None,
+        width=None,
+        num_inference_steps=50,
+        sigmas=None,
+        guidance_scale=5.0,
+        cfg_normalization=False,
+        cfg_truncation=1.0,
+        negative_prompt=None,
+        num_images_per_prompt=1,
+        generator=None,
+        latents=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
+        output_type="pil",
+        return_dict=True,
+        joint_attention_kwargs=None,
+        callback_on_step_end=None,
+        callback_on_step_end_tensor_inputs=None,
+        max_sequence_length=512,
+    ):
+        from diffusers.pipelines.z_image.pipeline_z_image import calculate_shift, retrieve_timesteps
+        from diffusers.pipelines.z_image.pipeline_output import ZImagePipelineOutput
+
+        if image is not None and not isinstance(image, list):
+            image = [image]
+        num_condition_images = len(image) if image is not None else 0
+
+        device = self._execution_device
+
+        self._guidance_scale = guidance_scale
+        self._joint_attention_kwargs = joint_attention_kwargs
+        self._interrupt = False
+        self._cfg_normalization = cfg_normalization
+        self._cfg_truncation = cfg_truncation
+
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
+        else:
+            batch_size = len(prompt_embeds)
+
+        # Encode prompts using inherited encode_prompt -> _encode_prompt
+        if prompt_embeds is None or prompt is not None:
+            prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                do_classifier_free_guidance=self.do_classifier_free_guidance,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                device=device,
+                max_sequence_length=max_sequence_length,
+                num_condition_images=num_condition_images,
+            )
+
+        # Process condition images
+        condition_images = []
+        resized_images = []
+        if image is not None:
+            for img in image:
+                image_width, image_height = img.size
+                if image_width * image_height > 1024 * 1024:
+                    if height is not None and width is not None:
+                        img = self.image_processor._resize_to_target_area(img, height * width)
+                    else:
+                        img = self.image_processor._resize_to_target_area(img, 1024 * 1024)
+                    image_width, image_height = img.size
+                resized_images.append(img)
+
+                multiple_of = self.vae_scale_factor * 2
+                image_width = (image_width // multiple_of) * multiple_of
+                image_height = (image_height // multiple_of) * multiple_of
+                img = self.image_processor.preprocess(img, height=image_height, width=image_width, resize_mode="crop")
+                condition_images.append(img)
+
+            if len(condition_images) > 0:
+                height = height or image_height
+                width = width or image_width
+        else:
+            height = height or 1024
+            width = width or 1024
+
+        num_channels_latents = self.transformer.config.get("in_channels", 16)
+
+        latents = self.prepare_latents(
+            batch_size * num_images_per_prompt, num_channels_latents,
+            height, width, torch.float32, device, generator, latents,
+        )
+
+        # Encode condition images to latents via VAE encoder
+        condition_latents = []
+        if num_condition_images > 0 and self.vae_encoder is not None:
+            for cimg in condition_images:
+                cimg = cimg.to(device=device, dtype=torch.float32)
+                vae_output = self.vae.encode(cimg)
+                if hasattr(vae_output, 'latent_dist'):
+                    clatent = vae_output.latent_dist.mode()[0]
+                else:
+                    clatent = vae_output[0]
+                clatent = (clatent - self.vae.config.shift_factor) * self.vae.config.scaling_factor
+                clatent = clatent.unsqueeze(1)  # add frame dim [C, 1, H, W]
+                condition_latents.append(clatent)
+
+        # Get SigLIP embeddings for condition images
+        condition_siglip_embeds = []
+        if num_condition_images > 0:
+            for rimg in resized_images:
+                siglip_inputs = self.siglip_processor(images=[rimg], return_tensors="pt").to(device)
+                shape = siglip_inputs.spatial_shapes[0]
+                hidden_state = self._call_ov_siglip(siglip_inputs)
+                B, N, C = hidden_state.shape
+                hidden_state = hidden_state[:, :shape[0] * shape[1]]
+                # Reshape: [1, H*W, C] -> [H, W, C]
+                hidden_state = hidden_state.view(shape[0], shape[1], C)
+                condition_siglip_embeds.append(hidden_state)
+
+        actual_batch_size = batch_size * num_images_per_prompt
+        image_seq_len = (latents.shape[2] // 2) * (latents.shape[3] // 2)
+
+        mu = calculate_shift(
+            image_seq_len,
+            self.scheduler.config.get("base_image_seq_len", 256),
+            self.scheduler.config.get("max_image_seq_len", 4096),
+            self.scheduler.config.get("base_shift", 0.5),
+            self.scheduler.config.get("max_shift", 1.15),
+        )
+        self.scheduler.sigma_min = 0.0
+        timesteps, num_inference_steps = retrieve_timesteps(
+            self.scheduler, num_inference_steps, device, sigmas=sigmas, mu=mu,
+        )
+        num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
+        self._num_timesteps = len(timesteps)
+
+        # Get static spatial shape from latents for zero-padding condition inputs
+        latent_h, latent_w = latents.shape[2], latents.shape[3]
+        cap_dim = prompt_embeds[0][0].shape[-1] if isinstance(prompt_embeds[0], list) else prompt_embeds[0].shape[-1]
+
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for i, t in enumerate(timesteps):
+                if self.interrupt:
+                    continue
+
+                timestep = t.expand(latents.shape[0])
+                timestep = (1000 - timestep) / 1000
+                t_norm = timestep[0].item()
+
+                current_guidance_scale = self.guidance_scale
+                if (self.do_classifier_free_guidance and self._cfg_truncation is not None
+                        and float(self._cfg_truncation) <= 1):
+                    if t_norm > self._cfg_truncation:
+                        current_guidance_scale = 0.0
+
+                apply_cfg = self.do_classifier_free_guidance and current_guidance_scale > 0
+
+                # Process per-batch-item (OV model traced with batch=1)
+                model_outputs = []
+                items_to_process = []
+
+                for bi in range(actual_batch_size):
+                    items_to_process.append((latents[bi], prompt_embeds[bi], timestep[bi:bi+1]))
+                    if apply_cfg:
+                        neg_embeds = negative_prompt_embeds[bi] if bi < len(negative_prompt_embeds) else negative_prompt_embeds[0]
+                        items_to_process.append((latents[bi], neg_embeds, timestep[bi:bi+1]))
+
+                for bi_latent, bi_prompt, bi_ts in items_to_process:
+                    # bi_latent: [C, H, W] -> need [1, C, 1, H, W]
+                    hs = bi_latent.unsqueeze(0).unsqueeze(2)
+
+                    if num_condition_images > 0 and len(condition_latents) > 0:
+                        # Condition image mode
+                        # bi_prompt is list of tensors: [cond_cap, target_cap, end_marker]
+                        # For num_condition_images=1: segment 0 = cond_cap, segment 1 = target_cap
+                        cond_cap = bi_prompt[0] if isinstance(bi_prompt, list) else bi_prompt
+                        target_cap = bi_prompt[1] if isinstance(bi_prompt, list) and len(bi_prompt) > 1 else cond_cap
+
+                        cond_lat = condition_latents[0].unsqueeze(0)  # [1, C, 1, H_c, W_c]
+                        sig_embed = condition_siglip_embeds[0]  # [H, W, C]
+                        sig_flat = sig_embed.reshape(1, -1, sig_embed.shape[-1])  # [1, H*W, C]
+
+                        out = self._call_ov_transformer_omni(
+                            hidden_states=hs,
+                            timestep=bi_ts,
+                            encoder_hidden_states=target_cap.unsqueeze(0),
+                            condition_hidden_states=cond_lat,
+                            condition_encoder_hidden_states=cond_cap.unsqueeze(0),
+                            siglip_hidden_states=sig_flat,
+                        )
+                    else:
+                        # Text-to-image mode (no condition images)
+                        cap = bi_prompt[0] if isinstance(bi_prompt, list) else bi_prompt
+                        # Zeros for condition inputs matching static export shapes
+                        out = self._call_ov_transformer_omni(
+                            hidden_states=hs,
+                            timestep=bi_ts,
+                            encoder_hidden_states=cap.unsqueeze(0),
+                            condition_hidden_states=torch.zeros(1, num_channels_latents, 1, latent_h, latent_w, device=device),
+                            condition_encoder_hidden_states=torch.zeros(1, 1, cap_dim, device=device),
+                            siglip_hidden_states=torch.zeros(1, 256, 1152, device=device),
+                        )
+
+                    model_outputs.append(out)
+
+                if apply_cfg:
+                    # Interleaved: [pos0, neg0, pos1, neg1, ...]
+                    noise_pred = []
+                    for j in range(actual_batch_size):
+                        pos = model_outputs[j * 2].float()
+                        neg = model_outputs[j * 2 + 1].float()
+                        pred = pos + current_guidance_scale * (pos - neg)
+                        if self._cfg_normalization and float(self._cfg_normalization) > 0.0:
+                            ori_pos_norm = torch.linalg.vector_norm(pos)
+                            new_pos_norm = torch.linalg.vector_norm(pred)
+                            max_new_norm = ori_pos_norm * float(self._cfg_normalization)
+                            if new_pos_norm > max_new_norm:
+                                pred = pred * (max_new_norm / new_pos_norm)
+                        noise_pred.append(pred)
+                    noise_pred = torch.stack(noise_pred, dim=0)
+                else:
+                    noise_pred = torch.stack([item.float() for item in model_outputs], dim=0)
+
+                noise_pred = noise_pred.squeeze(2) if noise_pred.ndim > 4 else noise_pred
+                noise_pred = -noise_pred
+
+                latents = self.scheduler.step(noise_pred.to(torch.float32), t, latents, return_dict=False)[0]
+
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                    progress_bar.update()
+
+        if output_type == "latent":
+            image = latents
+        else:
+            latents = latents.to(self.vae.dtype)
+            latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+            image = self.vae.decode(latents, return_dict=False)[0]
+            image = self.image_processor.postprocess(image, output_type=output_type)
+
+        self.maybe_free_model_hooks()
+        if not return_dict:
+            return (image,)
+        return ZImagePipelineOutput(images=image)
+
+
 SUPPORTED_OV_PIPELINES = [
     OVStableDiffusionPipeline,
     OVStableDiffusionImg2ImgPipeline,
@@ -1747,6 +2366,14 @@ if is_diffusers_version(">=", "0.32.0"):
 if is_diffusers_version(">=", "0.33.0"):
     SUPPORTED_OV_PIPELINES.append(OVSanaSprintPipeline)
     OV_TEXT2IMAGE_PIPELINES_MAPPING["sana-sprint"] = OVSanaSprintPipeline
+
+if ZImagePipeline is not object:
+    SUPPORTED_OV_PIPELINES.append(OVZImagePipeline)
+    OV_TEXT2IMAGE_PIPELINES_MAPPING["z-image"] = OVZImagePipeline
+
+if ZImageOmniPipeline is not object:
+    SUPPORTED_OV_PIPELINES.append(OVZImageOmniPipeline)
+    OV_TEXT2IMAGE_PIPELINES_MAPPING["z-image-omni"] = OVZImageOmniPipeline
 
 SUPPORTED_OV_PIPELINES_MAPPINGS = [
     OV_TEXT2IMAGE_PIPELINES_MAPPING,

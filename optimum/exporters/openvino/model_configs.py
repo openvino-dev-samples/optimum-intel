@@ -202,6 +202,8 @@ from .model_patcher import (
     SanaTextEncoderModelPatcher,
     XverseModelPatcher,
     Zamba2ModelPatcher,
+    ZImageTransformerModelPatcher,
+    ZImageOmniTransformerModelPatcher,
 )
 
 
@@ -5281,6 +5283,37 @@ class SiglipOpenVINOConfig(SiglipOnnxConfig):
     pass
 
 
+@register_in_tasks_manager("siglip2_vision_model", *["feature-extraction"])
+class Siglip2VisionModelOpenVINOConfig(OnnxConfig):
+    NORMALIZED_CONFIG_CLASS = NormalizedVisionConfig
+
+    @property
+    def inputs(self):
+        return {
+            "pixel_values": {0: "batch_size", 1: "num_patches"},
+            "pixel_attention_mask": {0: "batch_size", 1: "num_patches"},
+            "spatial_shapes": {0: "batch_size"},
+        }
+
+    @property
+    def outputs(self):
+        return {"last_hidden_state": {0: "batch_size", 1: "seq_len"}}
+
+    def generate_dummy_inputs(self, framework="pt", **kwargs):
+        import torch
+        batch_size = 1
+        patch_size = getattr(self._normalized_config, "patch_size", 16)
+        num_patches = getattr(self._normalized_config, "num_patches", 256)
+        grid_size = int(num_patches ** 0.5)
+        patch_dim = patch_size * patch_size * getattr(self._normalized_config, "num_channels", 3)
+        dummy = {
+            "pixel_values": torch.randn(batch_size, num_patches, patch_dim),
+            "pixel_attention_mask": torch.ones(batch_size, num_patches, dtype=torch.int32),
+            "spatial_shapes": torch.tensor([[grid_size, grid_size]], dtype=torch.long),
+        }
+        return dummy
+
+
 @register_in_tasks_manager(
     "transformer", *["feature-extraction", "sentence-similarity"], library_name="sentence_transformers"
 )
@@ -5451,3 +5484,165 @@ class Qwen3NextOpenVINOConfig(Qwen3OpenVINOConfig):
                 )
 
         return dummy_inputs
+
+
+class DummyZImageTransformerInputGenerator(DummyInputGenerator):
+    SUPPORTED_INPUT_NAMES = (
+        "hidden_states",
+        "encoder_hidden_states",
+        "timestep",
+    )
+
+    def __init__(
+        self,
+        task: str,
+        normalized_config: NormalizedVisionConfig,
+        batch_size: int = DEFAULT_DUMMY_SHAPES["batch_size"],
+        num_channels: int = DEFAULT_DUMMY_SHAPES["num_channels"],
+        width: int = DEFAULT_DUMMY_SHAPES["width"] // 4,
+        height: int = DEFAULT_DUMMY_SHAPES["height"] // 4,
+        sequence_length: int = DEFAULT_DUMMY_SHAPES["sequence_length"],
+        **kwargs,
+    ):
+        self.normalized_config = normalized_config
+        self.batch_size = 1
+        self.sequence_length = sequence_length
+        self.num_channels = num_channels
+        self.width = width
+        self.height = height
+        if getattr(normalized_config, "in_channels", None):
+            self.num_channels = normalized_config.in_channels // 4
+        if getattr(normalized_config, "cap_feat_dim", None):
+            self.cap_feat_dim = normalized_config.cap_feat_dim
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        if input_name == "hidden_states":
+            shape = [self.batch_size, self.num_channels * 4, 1, self.height * 4, self.width * 4]
+            return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
+        if input_name == "encoder_hidden_states":
+            shape = [self.batch_size, self.sequence_length, self.cap_feat_dim]
+            return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
+        if input_name == "timestep":
+            return self.random_float_tensor([1], max_value=1, min_value=0, framework=framework, dtype=float_dtype)
+
+        return super().generate(input_name, framework, int_dtype, float_dtype)
+
+
+@register_in_tasks_manager("z-image-transformer-2d", *["semantic-segmentation"], library_name="diffusers")
+class ZImageTransformerOpenVINOConfig(OnnxConfig):
+    NORMALIZED_CONFIG_CLASS = NormalizedVisionConfig
+
+    DUMMY_INPUT_GENERATOR_CLASSES = (
+        DummyZImageTransformerInputGenerator,
+    )
+
+    @property
+    def inputs(self):
+        common_inputs = {}
+        # Spatial dims must be static: unpatchify uses hardcoded reshape from trace
+        common_inputs["hidden_states"] = {}
+        common_inputs["encoder_hidden_states"] = {1: "seq_len"}
+        common_inputs["timestep"] = {}
+        return common_inputs
+
+    @property
+    def outputs(self):
+        common_outputs = {
+            "unified_results": {},
+        }
+        return common_outputs
+
+    def patch_model_for_export(
+        self, model: PreTrainedModel, model_kwargs: Optional[Dict[str, Any]] = None
+    ) -> ModelPatcher:
+        return ZImageTransformerModelPatcher(self, model, model_kwargs=model_kwargs)
+
+
+class DummyZImageOmniTransformerInputGenerator(DummyInputGenerator):
+    SUPPORTED_INPUT_NAMES = (
+        "hidden_states",
+        "encoder_hidden_states",
+        "timestep",
+        "condition_hidden_states",
+        "condition_encoder_hidden_states",
+        "siglip_hidden_states",
+    )
+
+    def __init__(
+        self,
+        task: str,
+        normalized_config: NormalizedVisionConfig,
+        batch_size: int = DEFAULT_DUMMY_SHAPES["batch_size"],
+        num_channels: int = DEFAULT_DUMMY_SHAPES["num_channels"],
+        width: int = DEFAULT_DUMMY_SHAPES["width"] // 4,
+        height: int = DEFAULT_DUMMY_SHAPES["height"] // 4,
+        sequence_length: int = DEFAULT_DUMMY_SHAPES["sequence_length"],
+        **kwargs,
+    ):
+        self.normalized_config = normalized_config
+        self.batch_size = 1
+        self.sequence_length = sequence_length
+        self.num_channels = num_channels
+        self.width = width
+        self.height = height
+        if getattr(normalized_config, "in_channels", None):
+            self.num_channels = normalized_config.in_channels // 4
+        if getattr(normalized_config, "cap_feat_dim", None):
+            self.cap_feat_dim = normalized_config.cap_feat_dim
+        self.siglip_feat_dim = getattr(normalized_config, "siglip_feat_dim", 1152) or 1152
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        if input_name == "hidden_states":
+            shape = [self.batch_size, self.num_channels * 4, 1, self.height * 4, self.width * 4]
+            return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
+        if input_name == "encoder_hidden_states":
+            shape = [self.batch_size, self.sequence_length, self.cap_feat_dim]
+            return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
+        if input_name == "timestep":
+            return self.random_float_tensor([1], max_value=1, min_value=0, framework=framework, dtype=float_dtype)
+        if input_name == "condition_hidden_states":
+            shape = [self.batch_size, self.num_channels * 4, 1, self.height * 4, self.width * 4]
+            return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
+        if input_name == "condition_encoder_hidden_states":
+            shape = [self.batch_size, self.sequence_length, self.cap_feat_dim]
+            return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
+        if input_name == "siglip_hidden_states":
+            # siglip features: [B, num_patches, siglip_dim]
+            shape = [self.batch_size, 256, self.siglip_feat_dim]
+            return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
+
+        return super().generate(input_name, framework, int_dtype, float_dtype)
+
+
+@register_in_tasks_manager("z-image-omni-transformer-2d", *["semantic-segmentation"], library_name="diffusers")
+class ZImageOmniTransformerOpenVINOConfig(OnnxConfig):
+    NORMALIZED_CONFIG_CLASS = NormalizedVisionConfig
+
+    DUMMY_INPUT_GENERATOR_CLASSES = (
+        DummyZImageOmniTransformerInputGenerator,
+    )
+
+    @property
+    def inputs(self):
+        common_inputs = {}
+        # Spatial dims must be static: unpatchify uses hardcoded reshape from trace
+        common_inputs["hidden_states"] = {}
+        common_inputs["encoder_hidden_states"] = {1: "seq_len"}
+        common_inputs["timestep"] = {}
+        common_inputs["condition_hidden_states"] = {}
+        common_inputs["condition_encoder_hidden_states"] = {1: "cond_seq_len"}
+        common_inputs["siglip_hidden_states"] = {}
+        return common_inputs
+
+    @property
+    def outputs(self):
+        common_outputs = {
+            "unified_results": {},
+        }
+        return common_outputs
+
+    def patch_model_for_export(
+        self, model: PreTrainedModel, model_kwargs: Optional[Dict[str, Any]] = None
+    ) -> ModelPatcher:
+        from optimum.exporters.openvino.model_patcher import ZImageOmniTransformerModelPatcher
+        return ZImageOmniTransformerModelPatcher(self, model, model_kwargs=model_kwargs)

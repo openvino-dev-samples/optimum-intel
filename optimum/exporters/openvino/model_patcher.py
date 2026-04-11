@@ -8418,7 +8418,7 @@ class ErnieImageTransformerModelPatcher(ModelPatcher):
                 attn.set_processor(self._orig_processors[i])
 
 
-class ErnieImageVAEPatcher(ModelPatcher):
+class AutoencoderKLFlux2VAEPatcher(ModelPatcher):
     def __enter__(self):
         super().__enter__()
         # Patch nearest-exact interpolation to nearest for OpenVINO compatibility
@@ -8440,3 +8440,7 @@ class ErnieImageVAEPatcher(ModelPatcher):
                     if hasattr(upsampler, "_orig_interpolate_mode") and upsampler._orig_interpolate_mode is not None:
                         if hasattr(upsampler, "interpolation_mode"):
                             upsampler.interpolation_mode = upsampler._orig_interpolate_mode
+
+
+# Backward-compatible alias
+ErnieImageVAEPatcher = AutoencoderKLFlux2VAEPatcher

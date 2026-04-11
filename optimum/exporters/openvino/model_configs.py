@@ -144,8 +144,8 @@ from .model_patcher import (
     DBRXModelPatcher,
     DeciLMModelPatcher,
     DeepseekPatcher,
+    AutoencoderKLFlux2VAEPatcher,
     ErnieImageTransformerModelPatcher,
-    ErnieImageVAEPatcher,
     FalconModelPatcher,
     FluxTransfromerModelPatcher,
     Gemma2ModelPatcher,
@@ -2739,7 +2739,8 @@ class ErnieImageTransformerOpenVINOConfig(UNetOpenVINOConfig):
 
 
 @register_in_tasks_manager("ernie-image-vae-encoder", *["semantic-segmentation"], library_name="diffusers")
-class ErnieImageVaeEncoderOpenVINOConfig(VaeEncoderOnnxConfig):
+@register_in_tasks_manager("autoencoder-kl-flux2-encoder", *["semantic-segmentation"], library_name="diffusers")
+class AutoencoderKLFlux2VaeEncoderOpenVINOConfig(VaeEncoderOnnxConfig):
     @property
     def inputs(self) -> Dict[str, Dict[int, str]]:
         return {
@@ -2753,9 +2754,14 @@ class ErnieImageVaeEncoderOpenVINOConfig(VaeEncoderOnnxConfig):
         }
 
 
+# Backward-compatible alias
+ErnieImageVaeEncoderOpenVINOConfig = AutoencoderKLFlux2VaeEncoderOpenVINOConfig
+
+
 @register_in_tasks_manager("ernie-image-vae-decoder", *["semantic-segmentation"], library_name="diffusers")
-class ErnieImageVaeDecoderOpenVINOConfig(VaeDecoderOnnxConfig):
-    _MODEL_PATCHER = ErnieImageVAEPatcher
+@register_in_tasks_manager("autoencoder-kl-flux2-decoder", *["semantic-segmentation"], library_name="diffusers")
+class AutoencoderKLFlux2VaeDecoderOpenVINOConfig(VaeDecoderOnnxConfig):
+    _MODEL_PATCHER = AutoencoderKLFlux2VAEPatcher
 
     @property
     def inputs(self) -> Dict[str, Dict[int, str]]:
@@ -2770,8 +2776,13 @@ class ErnieImageVaeDecoderOpenVINOConfig(VaeDecoderOnnxConfig):
         }
 
 
+# Backward-compatible alias
+ErnieImageVaeDecoderOpenVINOConfig = AutoencoderKLFlux2VaeDecoderOpenVINOConfig
+
+
 @register_in_tasks_manager("ernie-image-text-encoder", *["feature-extraction"], library_name="diffusers")
-class ErnieImageTextEncoderOpenVINOConfig(CLIPTextOpenVINOConfig):
+@register_in_tasks_manager("mistral3-text-encoder", *["feature-extraction"], library_name="diffusers")
+class Mistral3TextEncoderOpenVINOConfig(CLIPTextOpenVINOConfig):
     NORMALIZED_CONFIG_CLASS = NormalizedConfig.with_args(
         vocab_size="vocab_size",
         num_layers="num_hidden_layers",
@@ -2792,6 +2803,10 @@ class ErnieImageTextEncoderOpenVINOConfig(CLIPTextOpenVINOConfig):
         return {
             "input_ids": {0: "batch_size", 1: "sequence_length"},
         }
+
+
+# Backward-compatible alias
+ErnieImageTextEncoderOpenVINOConfig = Mistral3TextEncoderOpenVINOConfig
 
 
 class LTXVaeDummyInputGenerator(DummyVisionInputGenerator):

@@ -1138,7 +1138,7 @@ def get_ltx_video_models_for_export(pipeline, exporter, int_dtype, float_dtype):
 def get_ernie_image_models_for_export(pipeline, exporter, int_dtype, float_dtype):
     models_for_export = {}
 
-    # Text Encoder
+    # Text Encoder (Mistral3Model)
     text_encoder = pipeline.text_encoder
     text_encoder.config.output_hidden_states = True
     export_config_constructor = TasksManager.get_exporter_config_constructor(
@@ -1146,7 +1146,7 @@ def get_ernie_image_models_for_export(pipeline, exporter, int_dtype, float_dtype
         exporter=exporter,
         library_name="diffusers",
         task="feature-extraction",
-        model_type="ernie-image-text-encoder",
+        model_type="mistral3-text-encoder",
     )
     text_encoder_export_config = export_config_constructor(
         text_encoder.config, int_dtype=int_dtype, float_dtype=float_dtype
@@ -1167,7 +1167,7 @@ def get_ernie_image_models_for_export(pipeline, exporter, int_dtype, float_dtype
     )
     models_for_export["transformer"] = (transformer, transformer_export_config)
 
-    # VAE Encoder
+    # VAE Encoder (AutoencoderKLFlux2)
     vae_encoder = copy.deepcopy(pipeline.vae)
     vae_encoder.forward = lambda sample: {"latent_parameters": vae_encoder.encode(x=sample)["latent_dist"].parameters}
     vae_config_constructor = TasksManager.get_exporter_config_constructor(
@@ -1175,14 +1175,14 @@ def get_ernie_image_models_for_export(pipeline, exporter, int_dtype, float_dtype
         exporter=exporter,
         library_name="diffusers",
         task="semantic-segmentation",
-        model_type="ernie-image-vae-encoder",
+        model_type="autoencoder-kl-flux2-encoder",
     )
     vae_encoder_export_config = vae_config_constructor(
         vae_encoder.config, int_dtype=int_dtype, float_dtype=float_dtype
     )
     models_for_export["vae_encoder"] = (vae_encoder, vae_encoder_export_config)
 
-    # VAE Decoder
+    # VAE Decoder (AutoencoderKLFlux2)
     vae_decoder = copy.deepcopy(pipeline.vae)
     vae_decoder.forward = lambda latent_sample: vae_decoder.decode(z=latent_sample)
     vae_config_constructor = TasksManager.get_exporter_config_constructor(
@@ -1190,7 +1190,7 @@ def get_ernie_image_models_for_export(pipeline, exporter, int_dtype, float_dtype
         exporter=exporter,
         library_name="diffusers",
         task="semantic-segmentation",
-        model_type="ernie-image-vae-decoder",
+        model_type="autoencoder-kl-flux2-decoder",
     )
     vae_decoder_export_config = vae_config_constructor(
         vae_decoder.config, int_dtype=int_dtype, float_dtype=float_dtype

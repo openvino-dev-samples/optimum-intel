@@ -146,6 +146,7 @@ from .model_patcher import (
     DeepseekPatcher,
     AutoencoderKLFlux2VAEPatcher,
     ErnieImageTransformerModelPatcher,
+    Mistral3TextEncoderModelPatcher,
     FalconModelPatcher,
     FluxTransfromerModelPatcher,
     Gemma2ModelPatcher,
@@ -2788,6 +2789,7 @@ class Mistral3TextEncoderOpenVINOConfig(CLIPTextOpenVINOConfig):
         num_layers="num_hidden_layers",
         allow_new=True,
     )
+    _MODEL_PATCHER = Mistral3TextEncoderModelPatcher
 
     def __init__(self, config, task="feature-extraction", int_dtype="int64", float_dtype="fp32", preprocessors=None):
         # Mistral3Config has attributes under text_config; flatten them for normalized config

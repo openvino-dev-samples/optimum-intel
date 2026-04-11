@@ -8378,6 +8378,14 @@ class _ErnieImagePatchedAttnProcessor:
         if attention_mask is not None and attention_mask.ndim == 2:
             attention_mask = attention_mask[:, None, None, :]
 
+        # Convert bool mask to float32 for OpenVINO compatibility
+        if attention_mask is not None and attention_mask.dtype == torch.bool:
+            attention_mask = torch.where(
+                attention_mask,
+                torch.tensor(0.0, device=attention_mask.device, dtype=query.dtype),
+                torch.tensor(torch.finfo(torch.float16).min, device=attention_mask.device, dtype=query.dtype),
+            )
+
         hidden_states = F.scaled_dot_product_attention(
             query.transpose(1, 2),
             key.transpose(1, 2),
@@ -8416,6 +8424,20 @@ class ErnieImageTransformerModelPatcher(ModelPatcher):
             attn = layer.self_attention
             if i in self._orig_processors:
                 attn.set_processor(self._orig_processors[i])
+
+
+class Mistral3TextEncoderModelPatcher(ModelPatcher):
+    """Patcher for Mistral3 text encoder to ensure SDPA attention mask is float32 instead of bool."""
+
+    def __enter__(self):
+        super().__enter__()
+        if is_transformers_version(">=", "4.53"):
+            ALL_MASK_ATTENTION_FUNCTIONS.register("sdpa", eager_mask_without_vmap)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+        if is_transformers_version(">=", "4.53"):
+            ALL_MASK_ATTENTION_FUNCTIONS.register("sdpa", sdpa_mask)
 
 
 class AutoencoderKLFlux2VAEPatcher(ModelPatcher):

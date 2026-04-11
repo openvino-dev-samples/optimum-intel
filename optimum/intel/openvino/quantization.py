@@ -1632,6 +1632,19 @@ class OVQuantizer(OptimumQuantizer):
                 if isinstance(self.model, OVModelForVisualCausalLM):
                     quantization_configs["lm_model"] = quantization_config
                     default_config = OVWeightQuantizationConfig(bits=8, sym=True)
+                elif is_diffusers_available() and isinstance(self.model, OVDiffusionPipeline):
+                    # Apply INT4 to text_encoder(s) and transformer/unet with conservative ratio;
+                    # VAE is sensitive to quantization and kept at INT8
+                    for name in self.model.components:
+                        if name.startswith("text_encoder"):
+                            quantization_configs[name] = quantization_config
+                        elif name in ("unet", "transformer"):
+                            # Use a more conservative ratio for diffusion transformer to preserve image quality
+                            transformer_config = quantization_config.clone()
+                            if transformer_config.ratio is None or transformer_config.ratio > 0.8:
+                                transformer_config.ratio = 0.8
+                            quantization_configs[name] = transformer_config
+                    default_config = OVWeightQuantizationConfig(bits=8, sym=True)
                 else:
                     default_config = quantization_config
             elif not isinstance(quantization_config, OVPipelineQuantizationConfig):

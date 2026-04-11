@@ -1945,11 +1945,520 @@ class OVZImageOmniPipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, Z
     export_feature = "text-to-image"
     auto_model_class = ZImageOmniPipeline
 
+    # Split transformer sub-model names
+    _SPLIT_TRANSFORMER_PARTS = [
+        "transformer_patch_embed",
+        "transformer_noise_refiner",
+        "transformer_context_refiner",
+        "transformer_siglip_refiner",
+        "transformer_main",
+    ]
+
+    SEQ_MULTI_OF = 32  # Padding alignment from original transformer
+
     def reshape(self, batch_size: int, height: int, width: int, num_images_per_prompt: int = -1, num_frames: int = -1):
         self.is_dynamic = False
         if self.text_encoder is not None:
             self._reshape_text_encoder(self.text_encoder.model, batch_size=-1, tokenizer_max_length=-1)
         return self
+
+    @classmethod
+    def from_pretrained(cls, model_id, **kwargs):
+        """Override to detect and load split transformer sub-models."""
+        model_path = Path(model_id)
+
+        # Check if this is a split transformer layout
+        has_split = all((model_path / part / "openvino_model.xml").exists() for part in cls._SPLIT_TRANSFORMER_PARTS)
+
+        if has_split:
+            return cls._from_pretrained_split(model_path, **kwargs)
+        else:
+            # Fall back to standard loading (with export support)
+            return super().from_pretrained(model_id, **kwargs)
+
+    @classmethod
+    def _from_pretrained_split(cls, model_path, **kwargs):
+        """Load pipeline with split transformer sub-models."""
+        import openvino as ov
+        import json
+
+        device = kwargs.pop("device", "CPU")
+        compile_model = kwargs.pop("compile", True)
+        ov_config = kwargs.pop("ov_config", None) or {}
+
+        core = ov.Core()
+
+        # Load split transformer sub-models
+        split_models = {}
+        for part_name in cls._SPLIT_TRANSFORMER_PARTS:
+            xml_path = model_path / part_name / "openvino_model.xml"
+            split_models[part_name] = core.read_model(str(xml_path))
+
+        # Load other standard components
+        std_components = {}
+        for comp_name in ["text_encoder", "vae_decoder", "vae_encoder", "siglip"]:
+            xml_path = model_path / comp_name / "openvino_model.xml"
+            if xml_path.exists():
+                std_components[comp_name] = core.read_model(str(xml_path))
+            else:
+                std_components[comp_name] = None
+
+        # Load submodels (scheduler, tokenizer, etc.)
+        from diffusers import FlowMatchEulerDiscreteScheduler
+        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(str(model_path / "scheduler"))
+
+        tokenizer = None
+        tokenizer_path = model_path / "tokenizer"
+        if tokenizer_path.exists():
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_path))
+
+        siglip_processor = None
+        siglip_proc_path = model_path / "siglip_processor"
+        if siglip_proc_path.exists():
+            from transformers import AutoImageProcessor
+            siglip_processor = AutoImageProcessor.from_pretrained(str(siglip_proc_path))
+
+        # Load transformer config
+        transformer_config = {}
+        config_path = model_path / "transformer" / "config.json"
+        if not config_path.exists():
+            config_path = model_path / "transformer_patch_embed" / "config.json"
+        if config_path.exists():
+            with open(config_path) as f:
+                transformer_config = json.load(f)
+
+        # We need a "transformer" OV model for the base class constructor.
+        # Use the main transformer as a stand-in (it won't be called directly).
+        # The base __init__ requires a transformer parameter.
+        pipeline = cls(
+            scheduler=scheduler,
+            transformer=split_models["transformer_main"],
+            vae_decoder=std_components["vae_decoder"],
+            vae_encoder=std_components.get("vae_encoder"),
+            text_encoder=std_components.get("text_encoder"),
+            siglip=std_components.get("siglip"),
+            tokenizer=tokenizer,
+            siglip_processor=siglip_processor,
+            device=device,
+            compile=False,
+            dynamic_shapes=True,
+            ov_config=ov_config,
+            model_save_dir=str(model_path),
+        )
+
+        # Store split models and compile them
+        pipeline._split_models = {}
+        pipeline._split_compiled = {}
+        pipeline._ov_core = core
+        pipeline._ov_device = device
+        pipeline._ov_config = ov_config
+        for part_name in cls._SPLIT_TRANSFORMER_PARTS:
+            pipeline._split_models[part_name] = split_models[part_name]
+            pipeline._split_compiled[part_name] = None
+
+        # Store transformer config for Python-side logic
+        pipeline._transformer_config = transformer_config
+
+        # Initialize RoPE embedder for Python-side position encoding
+        pipeline._init_rope_embedder(transformer_config)
+
+        if compile_model:
+            pipeline.compile()
+
+        return pipeline
+
+    def _init_rope_embedder(self, config):
+        """Initialize RoPE embedder with precomputed frequencies for Python-side use."""
+        axes_dims = config.get("axes_dims", [32, 48, 48])
+        axes_lens = config.get("axes_lens", [1536, 512, 512])
+        theta = config.get("rope_theta", 256.0)
+
+        freqs_cis = []
+        for d, e in zip(axes_dims, axes_lens):
+            freqs = 1.0 / (theta ** (torch.arange(0, d, 2, dtype=torch.float64) / d))
+            timestep = torch.arange(e, dtype=torch.float64)
+            freqs = torch.outer(timestep, freqs).float()
+            cos_vals = torch.cos(freqs).repeat_interleave(2, dim=1, output_size=freqs.shape[1] * 2)
+            sin_vals = torch.sin(freqs).repeat_interleave(2, dim=1, output_size=freqs.shape[1] * 2)
+            freqs_cis.append(torch.stack([cos_vals, sin_vals], dim=-1))  # [max_len, dim, 2]
+
+        self._rope_freqs_cis = freqs_cis
+        self._axes_dims = axes_dims
+
+    def _rope_embed(self, ids):
+        """Compute RoPE embeddings from position IDs. ids: [N, 3]"""
+        result = []
+        device = ids.device
+        for i in range(len(self._axes_dims)):
+            index = ids[:, i]
+            fc = self._rope_freqs_cis[i].to(device)
+            result.append(fc[index])
+        return torch.cat(result, dim=-2)  # [N, total_dim, 2]
+
+    def _get_split_compiled(self, part_name):
+        """Get or compile a split sub-model."""
+        if self._split_compiled.get(part_name) is None:
+            self._split_compiled[part_name] = self._ov_core.compile_model(
+                self._split_models[part_name], self._ov_device, self._ov_config
+            )
+        return self._split_compiled[part_name]
+
+    def _call_split_model(self, part_name, inputs):
+        """Call a split OV sub-model with named inputs dict."""
+        compiled = self._get_split_compiled(part_name)
+        np_inputs = {}
+        for k, v in inputs.items():
+            if isinstance(v, torch.Tensor):
+                if v.dtype == torch.bool:
+                    np_inputs[k] = v.contiguous().numpy()
+                elif v.dtype == torch.long or v.dtype == torch.int32:
+                    np_inputs[k] = v.contiguous().numpy()
+                else:
+                    np_inputs[k] = v.to(torch.float32).contiguous().numpy()
+            else:
+                np_inputs[k] = v
+        result = compiled(np_inputs)
+        outputs = {}
+        for i, out in enumerate(compiled.outputs):
+            name = next(iter(out.get_names()))
+            outputs[name] = torch.from_numpy(result[out])
+        return outputs
+
+    @staticmethod
+    def _create_coordinate_grid(size, start=None, device=None):
+        """Create a coordinate grid. Same as ZImageTransformer2DModel.create_coordinate_grid."""
+        if start is None:
+            start = (0,) * len(size)
+        axes = [torch.arange(x0, x0 + span, dtype=torch.int32, device=device) for x0, span in zip(start, size)]
+        grids = torch.meshgrid(axes, indexing="ij")
+        return torch.stack(grids, dim=-1)
+
+    def _patchify_image(self, image, patch_size=2, f_patch_size=1):
+        """Patchify an image tensor: [C, F, H, W] -> [num_patches, patch_dim]."""
+        pH = pW = patch_size
+        pF = f_patch_size
+        C, F, H, W = image.size()
+        F_t, H_t, W_t = F // pF, H // pH, W // pW
+        image = image.view(C, F_t, pF, H_t, pH, W_t, pW)
+        image = image.permute(1, 3, 5, 2, 4, 6, 0).reshape(F_t * H_t * W_t, pF * pH * pW * C)
+        return image, (F, H, W), (F_t, H_t, W_t)
+
+    def _pad_with_ids(self, feat, pos_grid_size, pos_start, device, noise_mask_val=None):
+        """Pad feature to SEQ_MULTI_OF, create position IDs and pad mask. Matches original exactly."""
+        ori_len = len(feat)
+        pad_len = (-ori_len) % self.SEQ_MULTI_OF
+        total_len = ori_len + pad_len
+
+        ori_pos_ids = self._create_coordinate_grid(pos_grid_size, pos_start, device).flatten(0, 2)
+        if pad_len > 0:
+            pad_pos = self._create_coordinate_grid((1, 1, 1), (0, 0, 0), device).flatten(0, 2).repeat(pad_len, 1)
+            pos_ids = torch.cat([ori_pos_ids, pad_pos], dim=0)
+            padded_feat = torch.cat([feat, feat[-1:].repeat(pad_len, 1)], dim=0)
+            pad_mask = torch.cat([
+                torch.zeros(ori_len, dtype=torch.bool, device=device),
+                torch.ones(pad_len, dtype=torch.bool, device=device),
+            ])
+        else:
+            pos_ids = ori_pos_ids
+            padded_feat = feat
+            pad_mask = torch.zeros(ori_len, dtype=torch.bool, device=device)
+
+        noise_mask = [noise_mask_val] * total_len if noise_mask_val is not None else None
+        return padded_feat, pos_ids, pad_mask, total_len, noise_mask
+
+    def _patchify_and_embed_omni(
+        self, all_x, all_cap_feats, all_siglip_feats, images_noise_mask, patch_size=2, f_patch_size=1
+    ):
+        """
+        Python-side patchification for omni mode. Matches original exactly.
+        all_x: list[list[Tensor]] - [[cond_lat, target_lat], ...]
+        all_cap_feats: list[list[Tensor]] - [[cond_cap, target_cap], ...]
+        all_siglip_feats: list[list[Tensor|None]] - [[cond_siglip, None], ...]
+        images_noise_mask: list[list[int]] - [[0, 1], ...]
+        """
+        bsz = len(all_x)
+        device = all_x[0][-1].device
+        dtype = all_x[0][-1].dtype
+
+        all_x_out, all_x_size, all_x_pos, all_x_mask, all_x_len, all_x_noise = [], [], [], [], [], []
+        all_cap_out, all_cap_pos, all_cap_mask, all_cap_len, all_cap_noise = [], [], [], [], []
+        all_sig_out, all_sig_pos, all_sig_mask, all_sig_len, all_sig_noise = [], [], [], [], []
+
+        for i in range(bsz):
+            num_images = len(all_x[i])
+            cap_feats_list, cap_pos_list, cap_mask_list, cap_lens, cap_noise = [], [], [], [], []
+            cap_end_pos = []
+            cap_cu_len = 1
+
+            # Process captions
+            for j, cap_item in enumerate(all_cap_feats[i]):
+                noise_val = images_noise_mask[i][j] if j < len(images_noise_mask[i]) else 1
+                cap_out, cap_pos_j, cap_mask_j, cap_len, cap_nm = self._pad_with_ids(
+                    cap_item,
+                    (len(cap_item) + (-len(cap_item)) % self.SEQ_MULTI_OF, 1, 1),
+                    (cap_cu_len, 0, 0), device, noise_val,
+                )
+                cap_feats_list.append(cap_out)
+                cap_pos_list.append(cap_pos_j)
+                cap_mask_list.append(cap_mask_j)
+                cap_lens.append(cap_len)
+                cap_noise.extend(cap_nm)
+                cap_cu_len += len(cap_item)
+                cap_end_pos.append(cap_cu_len)
+                cap_cu_len += 2  # for image vae and siglip tokens
+
+            all_cap_out.append(torch.cat(cap_feats_list, dim=0))
+            all_cap_pos.append(torch.cat(cap_pos_list, dim=0))
+            all_cap_mask.append(torch.cat(cap_mask_list, dim=0))
+            all_cap_len.append(cap_lens)
+            all_cap_noise.append(cap_noise)
+
+            # Process images
+            x_feats_list, x_pos_list, x_mask_list, x_lens, x_size, x_noise = [], [], [], [], [], []
+            siglip_feat_dim = self._transformer_config.get("siglip_feat_dim", 1152)
+            for j, x_item in enumerate(all_x[i]):
+                noise_val = images_noise_mask[i][j]
+                if x_item is not None:
+                    x_patches, size, (F_t, H_t, W_t) = self._patchify_image(x_item, patch_size, f_patch_size)
+                    x_out, x_pos_j, x_mask_j, x_len, x_nm = self._pad_with_ids(
+                        x_patches, (F_t, H_t, W_t), (cap_end_pos[j], 0, 0), device, noise_val
+                    )
+                    x_size.append(size)
+                else:
+                    x_len = self.SEQ_MULTI_OF
+                    x_out = torch.zeros((x_len, 64), dtype=dtype, device=device)
+                    x_pos_j = self._create_coordinate_grid((1, 1, 1), (0, 0, 0), device).flatten(0, 2).repeat(x_len, 1)
+                    x_mask_j = torch.ones(x_len, dtype=torch.bool, device=device)
+                    x_nm = [noise_val] * x_len
+                    x_size.append(None)
+                x_feats_list.append(x_out)
+                x_pos_list.append(x_pos_j)
+                x_mask_list.append(x_mask_j)
+                x_lens.append(x_len)
+                x_noise.extend(x_nm)
+
+            all_x_out.append(torch.cat(x_feats_list, dim=0))
+            all_x_pos.append(torch.cat(x_pos_list, dim=0))
+            all_x_mask.append(torch.cat(x_mask_list, dim=0))
+            all_x_size.append(x_size)
+            all_x_len.append(x_lens)
+            all_x_noise.append(x_noise)
+
+            # Process siglip
+            if all_siglip_feats[i] is None:
+                all_sig_len.append([0] * num_images)
+                all_sig_out.append(None)
+            else:
+                sig_feats_list, sig_pos_list, sig_mask_list, sig_lens, sig_noise = [], [], [], [], []
+                for j, sig_item in enumerate(all_siglip_feats[i]):
+                    noise_val = images_noise_mask[i][j]
+                    if sig_item is not None:
+                        sig_H, sig_W, sig_C = sig_item.size()
+                        sig_flat = sig_item.permute(2, 0, 1).reshape(sig_H * sig_W, sig_C)
+                        sig_out, sig_pos_j, sig_mask_j, sig_len, sig_nm = self._pad_with_ids(
+                            sig_flat, (1, sig_H, sig_W), (cap_end_pos[j] + 1, 0, 0), device, noise_val
+                        )
+                        # Scale position IDs to match image resolution
+                        if x_size[j] is not None:
+                            sig_pos_j = sig_pos_j.float()
+                            sig_pos_j[..., 1] = sig_pos_j[..., 1] / max(sig_H - 1, 1) * (x_size[j][1] - 1)
+                            sig_pos_j[..., 2] = sig_pos_j[..., 2] / max(sig_W - 1, 1) * (x_size[j][2] - 1)
+                            sig_pos_j = sig_pos_j.to(torch.int32)
+                    else:
+                        sig_len = self.SEQ_MULTI_OF
+                        sig_out = torch.zeros((sig_len, siglip_feat_dim), dtype=dtype, device=device)
+                        sig_pos_j = self._create_coordinate_grid((1, 1, 1), (0, 0, 0), device).flatten(0, 2).repeat(sig_len, 1)
+                        sig_mask_j = torch.ones(sig_len, dtype=torch.bool, device=device)
+                        sig_nm = [noise_val] * sig_len
+                    sig_feats_list.append(sig_out)
+                    sig_pos_list.append(sig_pos_j)
+                    sig_mask_list.append(sig_mask_j)
+                    sig_lens.append(sig_len)
+                    sig_noise.extend(sig_nm)
+
+                all_sig_out.append(torch.cat(sig_feats_list, dim=0))
+                all_sig_pos.append(torch.cat(sig_pos_list, dim=0))
+                all_sig_mask.append(torch.cat(sig_mask_list, dim=0))
+                all_sig_len.append(sig_lens)
+                all_sig_noise.append(sig_noise)
+
+        # x position offsets (for unpatchify)
+        all_x_pos_offsets = [(sum(all_cap_len[i]), sum(all_cap_len[i]) + sum(all_x_len[i])) for i in range(bsz)]
+
+        return {
+            "x_out": all_x_out, "x_pos": all_x_pos, "x_mask": all_x_mask,
+            "x_len": all_x_len, "x_noise": all_x_noise, "x_size": all_x_size,
+            "cap_out": all_cap_out, "cap_pos": all_cap_pos, "cap_mask": all_cap_mask,
+            "cap_len": all_cap_len, "cap_noise": all_cap_noise,
+            "sig_out": all_sig_out, "sig_pos": all_sig_pos, "sig_mask": all_sig_mask,
+            "sig_len": all_sig_len, "sig_noise": all_sig_noise,
+            "x_pos_offsets": all_x_pos_offsets,
+        }
+
+    def _run_split_transformer_step(self, x_combined, cap_feats, siglip_feats, image_noise_mask, timestep):
+        """
+        Run one denoising step through split transformer sub-models.
+        Matches original ZImageTransformer2DModel.forward() logic exactly.
+
+        Args:
+            x_combined: list[list[Tensor]] - [[cond_lat, target_lat], ...] per batch
+            cap_feats: list[list[Tensor]] - [[cond_cap, target_cap], ...] per batch
+            siglip_feats: list[list[Tensor|None]] - [[siglip_3d, None], ...] per batch
+            image_noise_mask: list[list[int]] - [[0, 1], ...] per batch
+            timestep: Tensor [batch_size]
+
+        Returns: list[Tensor] - output per batch item [C, F, H, W]
+        """
+        patch_size = 2
+        f_patch_size = 1
+        device = x_combined[0][-1].device
+
+        # Step 1: Patchify (Python-side)
+        data = self._patchify_and_embed_omni(
+            x_combined, cap_feats, siglip_feats, image_noise_mask, patch_size, f_patch_size
+        )
+
+        bsz = len(x_combined)
+        results = []
+
+        # Process each batch item through the split models
+        for bi in range(bsz):
+            x_raw = data["x_out"][bi]         # [x_total_len, patch_dim]
+            x_mask = data["x_mask"][bi]       # [x_total_len]
+            x_pos = data["x_pos"][bi]         # [x_total_len, 3]
+            x_noise_list = data["x_noise"][bi]  # list[int]
+
+            cap_raw = data["cap_out"][bi]     # [cap_total_len, cap_dim]
+            cap_mask = data["cap_mask"][bi]   # [cap_total_len]
+            cap_pos = data["cap_pos"][bi]     # [cap_total_len, 3]
+            cap_noise_list = data["cap_noise"][bi]
+
+            # Step 2: Embed patches + timestep (OV sub-model)
+            if data["sig_out"][bi] is not None:
+                sig_raw = data["sig_out"][bi]
+                sig_mask = data["sig_mask"][bi]
+                sig_pos = data["sig_pos"][bi]
+                sig_noise_list = data["sig_noise"][bi]
+            else:
+                siglip_feat_dim = self._transformer_config.get("siglip_feat_dim", 1152)
+                sig_raw = torch.zeros(self.SEQ_MULTI_OF, siglip_feat_dim, device=device)
+                sig_mask = torch.ones(self.SEQ_MULTI_OF, dtype=torch.bool, device=device)
+                sig_pos = self._create_coordinate_grid((1, 1, 1), (0, 0, 0), device).flatten(0, 2).repeat(self.SEQ_MULTI_OF, 1)
+                sig_noise_list = [0] * self.SEQ_MULTI_OF
+
+            embed_out = self._call_split_model("transformer_patch_embed", {
+                "x_patches": x_raw,
+                "x_pad_mask": x_mask,
+                "cap_feats": cap_raw,
+                "cap_pad_mask": cap_mask,
+                "sig_feats": sig_raw,
+                "sig_pad_mask": sig_mask,
+                "timestep": timestep[bi:bi+1],
+            })
+
+            x_emb = embed_out["x_emb"]      # [x_total_len, dim]
+            cap_emb = embed_out["cap_emb"]   # [cap_total_len, dim]
+            sig_emb = embed_out["sig_emb"]   # [sig_total_len, dim]
+            t_noisy = embed_out["t_noisy"]   # [1, adaln_dim]
+            t_clean = embed_out["t_clean"]   # [1, adaln_dim]
+
+            # Step 3: Compute RoPE embeddings (Python-side)
+            # Note: pos_ids may be longer than features (original uses trim after pad_sequence)
+            x_freqs = self._rope_embed(x_pos)[:x_emb.shape[0]]
+            cap_freqs = self._rope_embed(cap_pos)[:cap_emb.shape[0]]
+            sig_freqs = self._rope_embed(sig_pos)[:sig_emb.shape[0]]
+
+            # Create attention masks (True = valid)
+            x_attn = (~x_mask).unsqueeze(0)        # [1, x_total_len]
+            cap_attn = (~cap_mask).unsqueeze(0)
+            sig_attn = (~sig_mask).unsqueeze(0)
+
+            # Create noise masks
+            x_noise_mask = torch.tensor(x_noise_list, dtype=torch.long, device=device).unsqueeze(0)  # [1, seq]
+            cap_noise_mask_t = torch.tensor(cap_noise_list, dtype=torch.long, device=device)
+            sig_noise_mask_t = torch.tensor(sig_noise_list, dtype=torch.long, device=device)
+
+            # Step 4: Noise refiner (2 blocks with dual modulation)
+            nr_out = self._call_split_model("transformer_noise_refiner", {
+                "x": x_emb.unsqueeze(0),
+                "attn_mask": x_attn,
+                "freqs_cis": x_freqs.unsqueeze(0),
+                "noise_mask": x_noise_mask,
+                "adaln_noisy": t_noisy,
+                "adaln_clean": t_clean,
+            })
+            x_refined = nr_out["output"]  # [1, x_total_len, dim]
+
+            # Step 5: Context refiner (2 blocks, no modulation)
+            cr_out = self._call_split_model("transformer_context_refiner", {
+                "x": cap_emb.unsqueeze(0),
+                "attn_mask": cap_attn,
+                "freqs_cis": cap_freqs.unsqueeze(0),
+            })
+            cap_refined = cr_out["output"]  # [1, cap_total_len, dim]
+
+            # Step 6: SigLIP refiner (2 blocks, no modulation)
+            sr_out = self._call_split_model("transformer_siglip_refiner", {
+                "x": sig_emb.unsqueeze(0),
+                "attn_mask": sig_attn,
+                "freqs_cis": sig_freqs.unsqueeze(0),
+            })
+            sig_refined = sr_out["output"]  # [1, sig_total_len, dim]
+
+            # Step 7: Build unified sequence [cap, x, siglip] (Python-side)
+            x_len = x_emb.shape[0]
+            cap_len = cap_emb.shape[0]
+            sig_len = sig_emb.shape[0]
+
+            unified = torch.cat([cap_refined[0, :cap_len], x_refined[0, :x_len], sig_refined[0, :sig_len]], dim=0)
+            unified_freqs = torch.cat([cap_freqs[:cap_len], x_freqs[:x_len], sig_freqs[:sig_len]], dim=0)
+            unified_noise = torch.tensor(
+                cap_noise_list + x_noise_list + sig_noise_list, dtype=torch.long, device=device
+            )
+            unified_attn = torch.cat([cap_attn[0], x_attn[0], sig_attn[0]], dim=0)
+
+            # Step 8: Main transformer layers + final layer (OV sub-model)
+            mt_out = self._call_split_model("transformer_main", {
+                "x": unified.unsqueeze(0),
+                "attn_mask": unified_attn.unsqueeze(0),
+                "freqs_cis": unified_freqs.unsqueeze(0),
+                "noise_mask": unified_noise.unsqueeze(0),
+                "adaln_noisy": t_noisy,
+                "adaln_clean": t_clean,
+            })
+            unified_out = mt_out["output"][0]  # [total_seq, out_dim]
+
+            # Step 9: Unpatchify (Python-side)
+            x_pos_offsets = data["x_pos_offsets"][bi]
+            x_sizes = data["x_size"][bi]  # list of (F, H, W) or None
+            out_channels = self._transformer_config.get("in_channels", 16)
+
+            # Extract the x section from unified output
+            x_section = unified_out[x_pos_offsets[0]:x_pos_offsets[1]]
+
+            # Walk through images to find the target (last image)
+            cu_len = 0
+            x_item = None
+            for j in range(len(x_sizes)):
+                if x_sizes[j] is None:
+                    cu_len += self.SEQ_MULTI_OF
+                else:
+                    F, H, W = x_sizes[j]
+                    ori_len = (F // f_patch_size) * (H // patch_size) * (W // patch_size)
+                    pad_len = (-ori_len) % self.SEQ_MULTI_OF
+                    x_item = (
+                        x_section[cu_len:cu_len + ori_len]
+                        .view(F // f_patch_size, H // patch_size, W // patch_size,
+                              f_patch_size, patch_size, patch_size, out_channels)
+                        .permute(6, 0, 3, 1, 4, 2, 5)
+                        .reshape(out_channels, F, H, W)
+                    )
+                    cu_len += ori_len + pad_len
+
+            results.append(x_item)  # Only the last (target) image
+
+        return results
 
     def _encode_prompt(self, prompt, device=None, prompt_embeds=None, max_sequence_length=512, num_condition_images=0):
         """Encode prompt for Omni mode. Returns list of list[Tensor] per batch item."""
@@ -2000,7 +2509,7 @@ class OVZImageOmniPipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, Z
         return embeddings_list
 
     def _call_ov_siglip(self, siglip_inputs):
-        """Call OV siglip model with all required inputs from processor output."""
+        """Call OV siglip model."""
         self.siglip.compile()
         model_inputs = {}
         for key in ["pixel_values", "pixel_attention_mask", "spatial_shapes"]:
@@ -2017,22 +2526,6 @@ class OVZImageOmniPipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, Z
                 else:
                     model_inputs[key] = val
         ov_outputs = self.siglip.request(model_inputs, share_inputs=True).to_dict()
-        return torch.from_numpy(next(iter(ov_outputs.values())))
-
-    def _call_ov_transformer_omni(self, hidden_states, timestep, encoder_hidden_states,
-                                   condition_hidden_states, condition_encoder_hidden_states,
-                                   siglip_hidden_states):
-        """Call OV transformer in omni mode. All inputs should already be [1, ...] tensors."""
-        self.transformer.compile()
-        model_inputs = {
-            "hidden_states": hidden_states.to(torch.float32).contiguous(),
-            "encoder_hidden_states": encoder_hidden_states.to(torch.float32).contiguous(),
-            "timestep": timestep.to(torch.float32).contiguous(),
-            "condition_hidden_states": condition_hidden_states.to(torch.float32).contiguous(),
-            "condition_encoder_hidden_states": condition_encoder_hidden_states.to(torch.float32).contiguous(),
-            "siglip_hidden_states": siglip_hidden_states.to(torch.float32).contiguous(),
-        }
-        ov_outputs = self.transformer.request(model_inputs, share_inputs=True).to_dict()
         return torch.from_numpy(next(iter(ov_outputs.values())))
 
     @torch.no_grad()
@@ -2082,7 +2575,7 @@ class OVZImageOmniPipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, Z
         else:
             batch_size = len(prompt_embeds)
 
-        # Encode prompts using inherited encode_prompt -> _encode_prompt
+        # Encode prompts
         if prompt_embeds is None or prompt is not None:
             prompt_embeds, negative_prompt_embeds = self.encode_prompt(
                 prompt=prompt,
@@ -2122,7 +2615,7 @@ class OVZImageOmniPipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, Z
             height = height or 1024
             width = width or 1024
 
-        num_channels_latents = self.transformer.config.get("in_channels", 16)
+        num_channels_latents = self._transformer_config.get("in_channels", 16)
 
         latents = self.prepare_latents(
             batch_size * num_images_per_prompt, num_channels_latents,
@@ -2140,10 +2633,15 @@ class OVZImageOmniPipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, Z
                 else:
                     clatent = vae_output[0]
                 clatent = (clatent - self.vae.config.shift_factor) * self.vae.config.scaling_factor
-                clatent = clatent.unsqueeze(1)  # add frame dim [C, 1, H, W]
+                clatent = clatent.unsqueeze(1)  # [C, 1, H, W]
                 condition_latents.append(clatent)
 
-        # Get SigLIP embeddings for condition images
+        # Replicate condition_latents for batch
+        condition_latents_batch = [condition_latents.copy() for _ in range(batch_size * num_images_per_prompt)]
+        if self.do_classifier_free_guidance:
+            neg_condition_latents_batch = [[lat.clone() for lat in batch] for batch in condition_latents_batch]
+
+        # Get SigLIP embeddings
         condition_siglip_embeds = []
         if num_condition_images > 0:
             for rimg in resized_images:
@@ -2152,9 +2650,17 @@ class OVZImageOmniPipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, Z
                 hidden_state = self._call_ov_siglip(siglip_inputs)
                 B, N, C = hidden_state.shape
                 hidden_state = hidden_state[:, :shape[0] * shape[1]]
-                # Reshape: [1, H*W, C] -> [H, W, C]
                 hidden_state = hidden_state.view(shape[0], shape[1], C)
                 condition_siglip_embeds.append(hidden_state)
+
+        condition_siglip_batch = [condition_siglip_embeds.copy() for _ in range(batch_size * num_images_per_prompt)]
+        if self.do_classifier_free_guidance:
+            neg_siglip_batch = [[se.clone() for se in batch] for batch in condition_siglip_batch]
+
+        # Format siglip: add None for target, wrap empty as None
+        condition_siglip_batch = [None if sels == [] else sels + [None] for sels in condition_siglip_batch]
+        if self.do_classifier_free_guidance:
+            neg_siglip_batch = [None if sels == [] else sels + [None] for sels in neg_siglip_batch]
 
         actual_batch_size = batch_size * num_images_per_prompt
         image_seq_len = (latents.shape[2] // 2) * (latents.shape[3] // 2)
@@ -2173,10 +2679,6 @@ class OVZImageOmniPipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, Z
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
 
-        # Get static spatial shape from latents for zero-padding condition inputs
-        latent_h, latent_w = latents.shape[2], latents.shape[3]
-        cap_dim = prompt_embeds[0][0].shape[-1] if isinstance(prompt_embeds[0], list) else prompt_embeds[0].shape[-1]
-
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -2194,60 +2696,41 @@ class OVZImageOmniPipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, Z
 
                 apply_cfg = self.do_classifier_free_guidance and current_guidance_scale > 0
 
-                # Process per-batch-item (OV model traced with batch=1)
-                model_outputs = []
-                items_to_process = []
+                # Build inputs matching original pipeline format
+                if apply_cfg:
+                    latent_model_input = latents.repeat(2, 1, 1, 1)
+                    pe_input = prompt_embeds + negative_prompt_embeds
+                    cl_input = condition_latents_batch + neg_condition_latents_batch
+                    cs_input = condition_siglip_batch + neg_siglip_batch
+                    ts_input = timestep.repeat(2)
+                else:
+                    latent_model_input = latents
+                    pe_input = prompt_embeds
+                    cl_input = condition_latents_batch
+                    cs_input = condition_siglip_batch
+                    ts_input = timestep
 
-                for bi in range(actual_batch_size):
-                    items_to_process.append((latents[bi], prompt_embeds[bi], timestep[bi:bi+1]))
-                    if apply_cfg:
-                        neg_embeds = negative_prompt_embeds[bi] if bi < len(negative_prompt_embeds) else negative_prompt_embeds[0]
-                        items_to_process.append((latents[bi], neg_embeds, timestep[bi:bi+1]))
+                latent_model_input = latent_model_input.unsqueeze(2)  # add frame dim
+                latent_list = list(latent_model_input.unbind(dim=0))
 
-                for bi_latent, bi_prompt, bi_ts in items_to_process:
-                    # bi_latent: [C, H, W] -> need [1, C, 1, H, W]
-                    hs = bi_latent.unsqueeze(0).unsqueeze(2)
+                current_batch = len(latent_list)
 
-                    if num_condition_images > 0 and len(condition_latents) > 0:
-                        # Condition image mode
-                        # bi_prompt is list of tensors: [cond_cap, target_cap, end_marker]
-                        # For num_condition_images=1: segment 0 = cond_cap, segment 1 = target_cap
-                        cond_cap = bi_prompt[0] if isinstance(bi_prompt, list) else bi_prompt
-                        target_cap = bi_prompt[1] if isinstance(bi_prompt, list) and len(bi_prompt) > 1 else cond_cap
+                # Build x_combined and image_noise_mask matching original format
+                x_combined = [cl_input[j] + [latent_list[j]] for j in range(current_batch)]
+                image_noise_mask = [[0] * len(cl_input[j]) + [1] for j in range(current_batch)]
 
-                        cond_lat = condition_latents[0].unsqueeze(0)  # [1, C, 1, H_c, W_c]
-                        sig_embed = condition_siglip_embeds[0]  # [H, W, C]
-                        sig_flat = sig_embed.reshape(1, -1, sig_embed.shape[-1])  # [1, H*W, C]
-
-                        out = self._call_ov_transformer_omni(
-                            hidden_states=hs,
-                            timestep=bi_ts,
-                            encoder_hidden_states=target_cap.unsqueeze(0),
-                            condition_hidden_states=cond_lat,
-                            condition_encoder_hidden_states=cond_cap.unsqueeze(0),
-                            siglip_hidden_states=sig_flat,
-                        )
-                    else:
-                        # Text-to-image mode (no condition images)
-                        cap = bi_prompt[0] if isinstance(bi_prompt, list) else bi_prompt
-                        # Zeros for condition inputs matching static export shapes
-                        out = self._call_ov_transformer_omni(
-                            hidden_states=hs,
-                            timestep=bi_ts,
-                            encoder_hidden_states=cap.unsqueeze(0),
-                            condition_hidden_states=torch.zeros(1, num_channels_latents, 1, latent_h, latent_w, device=device),
-                            condition_encoder_hidden_states=torch.zeros(1, 1, cap_dim, device=device),
-                            siglip_hidden_states=torch.zeros(1, 256, 1152, device=device),
-                        )
-
-                    model_outputs.append(out)
+                # Call split transformer
+                model_out_list = self._run_split_transformer_step(
+                    x_combined, pe_input, cs_input, image_noise_mask, ts_input
+                )
 
                 if apply_cfg:
-                    # Interleaved: [pos0, neg0, pos1, neg1, ...]
+                    pos_out = model_out_list[:actual_batch_size]
+                    neg_out = model_out_list[actual_batch_size:]
                     noise_pred = []
                     for j in range(actual_batch_size):
-                        pos = model_outputs[j * 2].float()
-                        neg = model_outputs[j * 2 + 1].float()
+                        pos = pos_out[j].float()
+                        neg = neg_out[j].float()
                         pred = pos + current_guidance_scale * (pos - neg)
                         if self._cfg_normalization and float(self._cfg_normalization) > 0.0:
                             ori_pos_norm = torch.linalg.vector_norm(pos)
@@ -2258,7 +2741,7 @@ class OVZImageOmniPipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, Z
                         noise_pred.append(pred)
                     noise_pred = torch.stack(noise_pred, dim=0)
                 else:
-                    noise_pred = torch.stack([item.float() for item in model_outputs], dim=0)
+                    noise_pred = torch.stack([item.float() for item in model_out_list], dim=0)
 
                 noise_pred = noise_pred.squeeze(2) if noise_pred.ndim > 4 else noise_pred
                 noise_pred = -noise_pred

@@ -486,9 +486,51 @@ def main_export(
         elif library_name == "diffusers" and _is_ernie_image:
             from diffusers import ErnieImagePipeline, ErnieImageTransformer2DModel, AutoencoderKLFlux2
             from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
-            from transformers import AutoModel, PreTrainedTokenizerFast
+            from transformers import AutoModel, AutoModelForCausalLM, PreTrainedTokenizerFast
 
             _dtype_kwarg = {k: v for k, v in loading_kwargs.items() if k == "torch_dtype"}
+
+            # Load PE model and tokenizer if available
+            _pe_model = None
+            _pe_tokenizer = None
+            _pe_path = Path(model_name_or_path) / "pe"
+            _pe_tokenizer_path = Path(model_name_or_path) / "pe_tokenizer"
+            if _pe_path.is_dir() and (_pe_path / "config.json").exists():
+                logger.info("Loading ERNIE-Image PE (Prompt Enhancer) model...")
+                # Register ministral3 config for PE model
+                from transformers import MistralConfig
+                from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+                if "ministral3" not in getattr(CONFIG_MAPPING, "_extra_content", {}):
+                    CONFIG_MAPPING.register("ministral3", MistralConfig)
+                _pe_model = AutoModelForCausalLM.from_pretrained(str(_pe_path), **_dtype_kwarg)
+            if _pe_tokenizer_path.is_dir():
+                import json as _json
+                import tempfile
+                import shutil
+                # PE tokenizer may use extra_special_tokens as list (transformers v5 format)
+                # which is incompatible with transformers v4. Patch it to dict format.
+                _pe_tok_config_path = _pe_tokenizer_path / "tokenizer_config.json"
+                if _pe_tok_config_path.exists():
+                    with open(_pe_tok_config_path, "r") as f:
+                        _pe_tok_config = _json.load(f)
+                    if isinstance(_pe_tok_config.get("extra_special_tokens"), list):
+                        # Convert list to dict for transformers v4 compatibility
+                        _pe_tok_config["extra_special_tokens"] = {
+                            tok: tok for tok in _pe_tok_config["extra_special_tokens"]
+                        }
+                        # Create a temporary directory with patched config
+                        _pe_tok_tmp = tempfile.mkdtemp()
+                        for fname in os.listdir(str(_pe_tokenizer_path)):
+                            shutil.copy2(str(_pe_tokenizer_path / fname), _pe_tok_tmp)
+                        with open(os.path.join(_pe_tok_tmp, "tokenizer_config.json"), "w") as f:
+                            _json.dump(_pe_tok_config, f, ensure_ascii=False)
+                        _pe_tokenizer = PreTrainedTokenizerFast.from_pretrained(_pe_tok_tmp)
+                        shutil.rmtree(_pe_tok_tmp)
+                    else:
+                        _pe_tokenizer = PreTrainedTokenizerFast.from_pretrained(str(_pe_tokenizer_path))
+                else:
+                    _pe_tokenizer = PreTrainedTokenizerFast.from_pretrained(str(_pe_tokenizer_path))
+
             model = ErnieImagePipeline(
                 text_encoder=AutoModel.from_pretrained(str(Path(model_name_or_path) / "text_encoder"), **_dtype_kwarg),
                 tokenizer=PreTrainedTokenizerFast.from_pretrained(str(Path(model_name_or_path) / "tokenizer")),
@@ -575,6 +617,79 @@ def main_export(
 
         if convert_tokenizer:
             maybe_convert_tokenizers(library_name, output, model, preprocessors, task=task)
+
+        # Export ERNIE-Image PE (Prompt Enhancer) model if available
+        if library_name == "diffusers" and _is_ernie_image and _pe_model is not None:
+            logger.info("Exporting ERNIE-Image PE (Prompt Enhancer) model...")
+            pe_output = output / "pe"
+            pe_output.mkdir(parents=True, exist_ok=True)
+
+            from optimum.intel import OVModelForCausalLM
+
+            # Determine weight format for PE model from ov_config
+            pe_export_kwargs = {}
+            if ov_config is not None and ov_config.quantization_config:
+                from optimum.intel.openvino.configuration import OVWeightQuantizationConfig
+                qc = ov_config.quantization_config
+                qc_bits = qc.bits if hasattr(qc, 'bits') else qc.get('bits') if isinstance(qc, dict) else None
+                if qc_bits == 4:
+                    pe_export_kwargs["quantization_config"] = OVWeightQuantizationConfig(
+                        bits=4, sym=False, ratio=1.0, group_size=128
+                    )
+                elif qc_bits == 8:
+                    pe_export_kwargs["load_in_8bit"] = True
+
+            # Export PE model using OVModelForCausalLM from the source directory
+            _pe_src_path = str(Path(model_name_or_path) / "pe")
+
+            # The PE model uses model_type "ministral3" which is compatible with Mistral
+            # but not registered in TasksManager. Temporarily patch the config.
+            import json as _pe_json
+            import tempfile
+            import shutil
+            _pe_tmp_dir = tempfile.mkdtemp()
+            for fname in os.listdir(_pe_src_path):
+                src = os.path.join(_pe_src_path, fname)
+                if os.path.isfile(src):
+                    shutil.copy2(src, _pe_tmp_dir)
+            # Patch config to use "mistral" model_type for export compatibility
+            _pe_cfg_path = os.path.join(_pe_tmp_dir, "config.json")
+            with open(_pe_cfg_path, "r") as f:
+                _pe_cfg = _pe_json.load(f)
+            _pe_cfg["model_type"] = "mistral"
+            _pe_cfg["architectures"] = ["MistralForCausalLM"]
+            with open(_pe_cfg_path, "w") as f:
+                _pe_json.dump(_pe_cfg, f, ensure_ascii=False)
+
+            ov_pe = OVModelForCausalLM.from_pretrained(
+                _pe_tmp_dir,
+                export=True,
+                compile=False,
+                **pe_export_kwargs,
+            )
+            ov_pe.save_pretrained(pe_output)
+            del ov_pe, _pe_model
+            shutil.rmtree(_pe_tmp_dir)
+
+            # Save PE tokenizer
+            if _pe_tokenizer is not None:
+                pe_tokenizer_output = output / "pe_tokenizer"
+                pe_tokenizer_output.mkdir(parents=True, exist_ok=True)
+                _pe_tokenizer.save_pretrained(pe_tokenizer_output)
+                del _pe_tokenizer
+
+            # Update model_index.json to include PE components
+            import json
+            model_index_path = output / "model_index.json"
+            if model_index_path.exists():
+                with open(model_index_path, "r") as f:
+                    model_index = json.load(f)
+                model_index["pe"] = ["optimum.intel", "OVModelForCausalLM"]
+                model_index["pe_tokenizer"] = ["transformers", "PreTrainedTokenizerFast"]
+                with open(model_index_path, "w") as f:
+                    json.dump(model_index, f, indent=2)
+
+            logger.info("PE model export completed.")
 
         clear_class_registry()
         del model

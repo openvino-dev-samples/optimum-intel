@@ -1679,6 +1679,34 @@ class OVLTXPipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, LTXPipel
     auto_model_class = LTXPipeline
 
 
+def _load_pe_tokenizer(pe_tokenizer_path):
+    """Load PE tokenizer with compatibility fix for transformers v4 vs v5 format."""
+    import json as _json
+    from transformers import PreTrainedTokenizerFast
+
+    pe_tokenizer_path = Path(pe_tokenizer_path)
+    tok_config_path = pe_tokenizer_path / "tokenizer_config.json"
+    if tok_config_path.exists():
+        with open(tok_config_path, "r") as f:
+            tok_config = _json.load(f)
+        if isinstance(tok_config.get("extra_special_tokens"), list):
+            import tempfile
+            import shutil
+
+            tok_config["extra_special_tokens"] = {
+                tok: tok for tok in tok_config["extra_special_tokens"]
+            }
+            tmp_dir = tempfile.mkdtemp()
+            for fname in os.listdir(str(pe_tokenizer_path)):
+                shutil.copy2(str(pe_tokenizer_path / fname), tmp_dir)
+            with open(os.path.join(tmp_dir, "tokenizer_config.json"), "w") as f:
+                _json.dump(tok_config, f, ensure_ascii=False)
+            tokenizer = PreTrainedTokenizerFast.from_pretrained(tmp_dir)
+            shutil.rmtree(tmp_dir)
+            return tokenizer
+    return PreTrainedTokenizerFast.from_pretrained(str(pe_tokenizer_path))
+
+
 class OVErnieImagePipeline(OVDiffusionPipeline, ErnieImagePipeline):
     main_input_name = "prompt"
     export_feature = "text-to-image"
@@ -1705,7 +1733,7 @@ class OVErnieImagePipeline(OVDiffusionPipeline, ErnieImagePipeline):
             tokenizer_path = Path(model_path) / "tokenizer" if (Path(model_path) / "tokenizer").is_dir() else model_path
             kwargs["tokenizer"] = PreTrainedTokenizerFast.from_pretrained(str(tokenizer_path))
 
-        # Skip pe and pe_tokenizer (optional components)
+        # Skip pe and pe_tokenizer for the base pipeline init (handled after)
         if "pe" not in kwargs:
             kwargs["pe"] = None
         if "pe_tokenizer" not in kwargs:
@@ -1728,7 +1756,42 @@ class OVErnieImagePipeline(OVDiffusionPipeline, ErnieImagePipeline):
 
             pipeline.vae.bn = _MockBN(bn_stats["running_mean"], bn_stats["running_var"])
 
+        # Load PE (Prompt Enhancer) model if available
+        pe_path = Path(model_path) / "pe"
+        pe_tokenizer_path = Path(model_path) / "pe_tokenizer"
+        if pe_path.is_dir() and (pe_path / "openvino_model.xml").exists():
+            from optimum.intel.openvino.modeling_decoder import OVModelForCausalLM
+
+            logger.info("Loading ERNIE-Image PE (Prompt Enhancer) model...")
+            pipeline.pe = OVModelForCausalLM.from_pretrained(
+                str(pe_path),
+                device=pipeline._device,
+                compile=True,
+            )
+        if pe_tokenizer_path.is_dir():
+            from transformers import PreTrainedTokenizerFast
+
+            pipeline.pe_tokenizer = _load_pe_tokenizer(pe_tokenizer_path)
+
         return pipeline
+
+    def _save_pretrained(self, save_directory):
+        """Save model including PE components."""
+        super()._save_pretrained(save_directory)
+
+        save_directory = Path(save_directory)
+
+        # Save PE model if available
+        if getattr(self, "pe", None) is not None and hasattr(self.pe, "save_pretrained"):
+            pe_dir = save_directory / "pe"
+            pe_dir.mkdir(parents=True, exist_ok=True)
+            self.pe.save_pretrained(pe_dir)
+
+        # Save PE tokenizer if available
+        if getattr(self, "pe_tokenizer", None) is not None and hasattr(self.pe_tokenizer, "save_pretrained"):
+            pe_tokenizer_dir = save_directory / "pe_tokenizer"
+            pe_tokenizer_dir.mkdir(parents=True, exist_ok=True)
+            self.pe_tokenizer.save_pretrained(pe_tokenizer_dir)
 
 
 SUPPORTED_OV_PIPELINES = [

@@ -191,15 +191,19 @@ result.images[0].save("output.png")
 
 ### 4.2 使用 Prompt Enhancer（PE）
 
-如果导出的模型包含 PE 组件，可通过 `use_pe=True` 自动增强 prompt：
+如果导出的模型包含 PE 组件，可通过 `use_pe=True` 自动增强 prompt。
+加载时可通过 `load_pe` 参数控制是否加载 PE 模型（默认 `True`）：
 
 ```python
 from optimum.intel import OVErnieImagePipeline
 import torch
 
+# load_pe=True（默认）时自动加载 PE 模型和 tokenizer
+# load_pe=False 时跳过 PE 加载（节省内存，不支持 use_pe=True）
 pipe = OVErnieImagePipeline.from_pretrained(
     "./ernie_image_turbo_int4",
     device="CPU",
+    load_pe=True,  # 默认 True，设为 False 可跳过 PE 加载
 )
 
 generator = torch.Generator("cpu").manual_seed(42)
@@ -223,6 +227,8 @@ if result.revised_prompts:
 ```
 
 > **说明**：
+> - `load_pe=True`（默认）时，`from_pretrained` 会自动加载 PE 模型和 tokenizer。
+> - `load_pe=False` 时跳过 PE 加载，节省内存，此时 `use_pe=True` 会被自动忽略。
 > - `use_pe=True` 时，PE 模型会将简短的 prompt 自动扩展为丰富的视觉描述。
 > - 如果导出的模型不包含 PE 组件，`use_pe=True` 会被自动忽略，不影响推理。
 > - PE 模型使用 `OVModelForCausalLM`，支持 OpenVINO 加速的自回归生成。

@@ -1713,7 +1713,7 @@ class OVErnieImagePipeline(OVDiffusionPipeline, ErnieImagePipeline):
     auto_model_class = ErnieImagePipeline
 
     @classmethod
-    def _from_pretrained(cls, model_id, config, **kwargs):
+    def _from_pretrained(cls, model_id, config, load_pe=True, **kwargs):
         # Register ministral3 config for ERNIE-Image text encoder (Mistral3 uses ministral3 sub-config)
         try:
             from transformers import MistralConfig
@@ -1756,22 +1756,21 @@ class OVErnieImagePipeline(OVDiffusionPipeline, ErnieImagePipeline):
 
             pipeline.vae.bn = _MockBN(bn_stats["running_mean"], bn_stats["running_var"])
 
-        # Load PE (Prompt Enhancer) model if available
-        pe_path = Path(model_path) / "pe"
-        pe_tokenizer_path = Path(model_path) / "pe_tokenizer"
-        if pe_path.is_dir() and (pe_path / "openvino_model.xml").exists():
-            from optimum.intel.openvino.modeling_decoder import OVModelForCausalLM
+        # Load PE (Prompt Enhancer) model if load_pe is True
+        if load_pe:
+            pe_path = Path(model_path) / "pe"
+            pe_tokenizer_path = Path(model_path) / "pe_tokenizer"
+            if pe_path.is_dir() and (pe_path / "openvino_model.xml").exists():
+                from optimum.intel.openvino.modeling_decoder import OVModelForCausalLM
 
-            logger.info("Loading ERNIE-Image PE (Prompt Enhancer) model...")
-            pipeline.pe = OVModelForCausalLM.from_pretrained(
-                str(pe_path),
-                device=pipeline._device,
-                compile=True,
-            )
-        if pe_tokenizer_path.is_dir():
-            from transformers import PreTrainedTokenizerFast
-
-            pipeline.pe_tokenizer = _load_pe_tokenizer(pe_tokenizer_path)
+                logger.info("Loading ERNIE-Image PE (Prompt Enhancer) model...")
+                pipeline.pe = OVModelForCausalLM.from_pretrained(
+                    str(pe_path),
+                    device=pipeline._device,
+                    compile=True,
+                )
+            if pe_tokenizer_path.is_dir():
+                pipeline.pe_tokenizer = _load_pe_tokenizer(pe_tokenizer_path)
 
         return pipeline
 

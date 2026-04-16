@@ -491,12 +491,40 @@ def main_export(
             _dtype_kwarg = {k: v for k, v in loading_kwargs.items() if k == "torch_dtype"}
             _is_local = Path(model_name_or_path).is_dir()
 
+            # Determine if PE components exist
+            _has_pe = False
+            _has_pe_tokenizer = False
+            if _is_local:
+                _pe_path = Path(model_name_or_path) / "pe"
+                _pe_tokenizer_path = Path(model_name_or_path) / "pe_tokenizer"
+                _has_pe = _pe_path.is_dir() and (_pe_path / "config.json").exists()
+                _has_pe_tokenizer = _pe_tokenizer_path.is_dir()
+            else:
+                # Check remote config for PE components
+                _has_pe = "pe" in _diffusers_config
+                _has_pe_tokenizer = "pe_tokenizer" in _diffusers_config
+                if _has_pe or _has_pe_tokenizer:
+                    from huggingface_hub import snapshot_download
+                    _allow_patterns = []
+                    if _has_pe:
+                        _allow_patterns.append("pe/*")
+                    if _has_pe_tokenizer:
+                        _allow_patterns.append("pe_tokenizer/*")
+                    _cached_dir = snapshot_download(
+                        model_name_or_path,
+                        allow_patterns=_allow_patterns,
+                        cache_dir=cache_dir,
+                        token=token,
+                        local_files_only=local_files_only,
+                        force_download=force_download,
+                    )
+                    _pe_path = Path(_cached_dir) / "pe"
+                    _pe_tokenizer_path = Path(_cached_dir) / "pe_tokenizer"
+
             # Load PE model and tokenizer if available
             _pe_model = None
             _pe_tokenizer = None
-            _pe_path = Path(model_name_or_path) / "pe"
-            _pe_tokenizer_path = Path(model_name_or_path) / "pe_tokenizer"
-            if _is_local and _pe_path.is_dir() and (_pe_path / "config.json").exists():
+            if _has_pe:
                 logger.info("Loading ERNIE-Image PE (Prompt Enhancer) model...")
                 # Register ministral3 config for PE model
                 from transformers import MistralConfig
@@ -504,7 +532,7 @@ def main_export(
                 if "ministral3" not in getattr(CONFIG_MAPPING, "_extra_content", {}):
                     CONFIG_MAPPING.register("ministral3", MistralConfig)
                 _pe_model = AutoModelForCausalLM.from_pretrained(str(_pe_path), **_dtype_kwarg)
-            if _is_local and _pe_tokenizer_path.is_dir():
+            if _has_pe_tokenizer:
                 import json as _json
                 import tempfile
                 import shutil
@@ -648,7 +676,7 @@ def main_export(
                     pe_export_kwargs["load_in_8bit"] = True
 
             # Export PE model using OVModelForCausalLM from the source directory
-            _pe_src_path = str(Path(model_name_or_path) / "pe")
+            _pe_src_path = str(_pe_path)
 
             # The PE model uses model_type "ministral3" which is compatible with Mistral
             # but not registered in TasksManager. Temporarily patch the config.

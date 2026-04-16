@@ -489,13 +489,14 @@ def main_export(
             from transformers import AutoModel, AutoModelForCausalLM, PreTrainedTokenizerFast
 
             _dtype_kwarg = {k: v for k, v in loading_kwargs.items() if k == "torch_dtype"}
+            _is_local = Path(model_name_or_path).is_dir()
 
             # Load PE model and tokenizer if available
             _pe_model = None
             _pe_tokenizer = None
             _pe_path = Path(model_name_or_path) / "pe"
             _pe_tokenizer_path = Path(model_name_or_path) / "pe_tokenizer"
-            if _pe_path.is_dir() and (_pe_path / "config.json").exists():
+            if _is_local and _pe_path.is_dir() and (_pe_path / "config.json").exists():
                 logger.info("Loading ERNIE-Image PE (Prompt Enhancer) model...")
                 # Register ministral3 config for PE model
                 from transformers import MistralConfig
@@ -503,7 +504,7 @@ def main_export(
                 if "ministral3" not in getattr(CONFIG_MAPPING, "_extra_content", {}):
                     CONFIG_MAPPING.register("ministral3", MistralConfig)
                 _pe_model = AutoModelForCausalLM.from_pretrained(str(_pe_path), **_dtype_kwarg)
-            if _pe_tokenizer_path.is_dir():
+            if _is_local and _pe_tokenizer_path.is_dir():
                 import json as _json
                 import tempfile
                 import shutil
@@ -531,12 +532,19 @@ def main_export(
                 else:
                     _pe_tokenizer = PreTrainedTokenizerFast.from_pretrained(str(_pe_tokenizer_path))
 
+            if _is_local:
+                def _sub(subfolder):
+                    return {"pretrained_model_name_or_path": str(Path(model_name_or_path) / subfolder)}
+            else:
+                def _sub(subfolder):
+                    return {"pretrained_model_name_or_path": model_name_or_path, "subfolder": subfolder}
+
             model = ErnieImagePipeline(
-                text_encoder=AutoModel.from_pretrained(str(Path(model_name_or_path) / "text_encoder"), **_dtype_kwarg),
-                tokenizer=PreTrainedTokenizerFast.from_pretrained(str(Path(model_name_or_path) / "tokenizer")),
-                transformer=ErnieImageTransformer2DModel.from_pretrained(str(Path(model_name_or_path) / "transformer"), **_dtype_kwarg),
-                vae=AutoencoderKLFlux2.from_pretrained(str(Path(model_name_or_path) / "vae"), **_dtype_kwarg),
-                scheduler=FlowMatchEulerDiscreteScheduler.from_pretrained(str(Path(model_name_or_path) / "scheduler")),
+                text_encoder=AutoModel.from_pretrained(**_sub("text_encoder"), **_dtype_kwarg),
+                tokenizer=PreTrainedTokenizerFast.from_pretrained(**_sub("tokenizer")),
+                transformer=ErnieImageTransformer2DModel.from_pretrained(**_sub("transformer"), **_dtype_kwarg),
+                vae=AutoencoderKLFlux2.from_pretrained(**_sub("vae"), **_dtype_kwarg),
+                scheduler=FlowMatchEulerDiscreteScheduler.from_pretrained(**_sub("scheduler")),
                 pe=None,
                 pe_tokenizer=None,
             )

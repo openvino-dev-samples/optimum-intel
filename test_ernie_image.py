@@ -15,8 +15,10 @@ Usage:
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -150,9 +152,10 @@ def compute_image_similarity(img1: Image.Image, img2: Image.Image) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description="Test ERNIE-Image with OpenVINO")
-    parser.add_argument("--model-path", type=str, default="/home/ethan/intel/ERNIE-image/ERNIE-Image",
+    parser.add_argument("--model-path", type=str, required=True,
                         help="Path to ERNIE-Image model")
-    parser.add_argument("--output-dir", type=str, default="/tmp/ernie_image_ov_test",
+    parser.add_argument("--output-dir", type=str,
+                        default=os.path.join(tempfile.gettempdir(), "ernie_image_ov_test"),
                         help="Base output directory for exported models")
     parser.add_argument("--prompt", type=str, default="a cute cat sitting on a colorful cushion, studio lighting, high quality",
                         help="Text prompt for image generation")
@@ -174,13 +177,13 @@ def main():
     if not args.skip_export:
         # FP32 export
         if os.path.exists(fp32_dir):
-            subprocess.run(["rm", "-rf", fp32_dir])
+            shutil.rmtree(fp32_dir)
         export_model(args.model_path, fp32_dir, "fp32")
 
         # INT4 export
         if not args.skip_int4:
             if os.path.exists(int4_dir):
-                subprocess.run(["rm", "-rf", int4_dir])
+                shutil.rmtree(int4_dir)
             export_model(args.model_path, int4_dir, "int4")
 
     # ──────────────── Step 2: PyTorch Inference ────────────────

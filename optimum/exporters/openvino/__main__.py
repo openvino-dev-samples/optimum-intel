@@ -295,6 +295,7 @@ def main_export(
     do_gptq_patching = False
     do_quant_patching = False
     patch_16bit = False
+    _is_ernie_image = False
     loading_kwargs = model_loading_kwargs or {}
     if variant is not None:
         loading_kwargs["variant"] = variant

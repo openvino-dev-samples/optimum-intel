@@ -8323,7 +8323,8 @@ def _ernie_image_rope_float32(pos, dim, theta):
     """RoPE computation using float32 instead of float64 for OpenVINO compatibility."""
     import torch
 
-    assert dim % 2 == 0
+    if dim % 2 != 0:
+        raise ValueError(f"RoPE dimension must be even, got {dim}")
     scale = torch.arange(0, dim, 2, dtype=torch.float32, device=pos.device) / dim
     omega = 1.0 / (theta**scale)
     out = torch.einsum("...n,d->...nd", pos.float(), omega)

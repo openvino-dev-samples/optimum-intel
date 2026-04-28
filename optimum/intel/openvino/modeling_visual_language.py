@@ -4129,8 +4129,30 @@ class _OVGlmOcrForCausalLM(OVModelForVisualCausalLM):
             **kwargs,
         )
         return QWen2VLModelOutputWithPast(
-            logits=result.logits, past_key_values=result.past_key_values, rope_deltas=rope_deltas
+            logits=result.logits,
+            past_key_values=result.past_key_values,
+            rope_deltas=self.rope_deltas,
         )
+
+    def _update_model_kwargs_for_generation(
+        self,
+        outputs: ModelOutput,
+        model_kwargs: Dict[str, Any],
+        is_encoder_decoder: bool = False,
+        num_new_tokens: int = 1,
+    ) -> Dict[str, Any]:
+        model_kwargs = super()._update_model_kwargs_for_generation(
+            outputs=outputs,
+            model_kwargs=model_kwargs,
+            is_encoder_decoder=is_encoder_decoder,
+            num_new_tokens=num_new_tokens,
+        )
+        # Surface rope_deltas so subsequent decode steps can reconstruct M-RoPE
+        if getattr(outputs, "rope_deltas", None) is not None:
+            model_kwargs["rope_deltas"] = outputs.rope_deltas
+        # Drop multimodal state that only belongs to the prefill step.
+        model_kwargs.pop("mm_token_type_ids", None)
+        return model_kwargs
 
     def generate(self, *args, **kwargs):
         self.rope_deltas = None

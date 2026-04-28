@@ -31,7 +31,13 @@ from transformers.generation.logits_process import LogitsProcessorList
 from transformers.generation.stopping_criteria import StoppingCriteriaList
 from transformers.generation.utils import GenerateOutput, GenerationMode
 from transformers.modeling_outputs import CausalLMOutputWithPast, ModelOutput
-from transformers.models.mamba.modeling_mamba import MambaCache
+try:
+    from transformers.models.mamba.modeling_mamba import MambaCache
+except ImportError:
+    # `MambaCache` was removed in transformers 5.x. Fall back to the generic
+    # `Cache` base class as an attribute container for subclassing; runtime
+    # behavior relies on the subclass (OVCacheWithMambaStates) overrides.
+    from transformers.cache_utils import Cache as MambaCache
 from transformers.utils.hub import PushToHubMixin
 
 from optimum.utils.normalized_config import NormalizedConfigManager

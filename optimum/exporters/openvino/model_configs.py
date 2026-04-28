@@ -198,6 +198,8 @@ from .model_patcher import (
     PhiMoEModelPatcher,
     Qwen2_5_VLVisionEmbMergerPatcher,
     Qwen2MoEPatcher,
+    GlmOcrLanguageModelPatcher,
+    GlmOcrVisionEmbMergerPatcher,
     Qwen2VLLanguageModelPatcher,
     Qwen2VLVisionEmbMergerPatcher,
     Qwen3MoeModelPatcher,
@@ -3998,6 +4000,212 @@ class GLMOpenVINOConfig(LlamaOpenVINOConfig):
 )
 class GLM4OpenVINOConfig(LlamaOpenVINOConfig):
     MIN_TRANSFORMERS_VERSION = "4.51.3"
+
+
+@register_in_tasks_manager(
+    "glm_ocr_text",
+    *[
+        "feature-extraction",
+        "feature-extraction-with-past",
+        "text-generation",
+        "text-generation-with-past",
+    ],
+    library_name="transformers",
+)
+class GlmOcrTextOpenVINOConfig(LlamaOpenVINOConfig):
+    # glm_ocr_text is the inner decoder used by GLM-OCR. It is a GLM-4.x-style
+    # decoder with 3-D M-RoPE; export pipeline uses the same decoder patcher as
+    # other Llama-style decoders, the 3-D position_ids are supplied by the VLM
+    # runtime. The rotary embedding is patched inside GlmOcrLanguageModelPatcher.
+    MIN_TRANSFORMERS_VERSION = "5.0.0"
+
+
+class GlmOcrConfigBehavior(str, enum.Enum):
+    LANGUAGE = "language"
+    VISION_EMBEDDINGS = "vision_embeddings"
+    VISION_EMBEDDINGS_MERGER = "vision_embeddings_merger"
+    TEXT_EMBEDDINGS = "text_embeddings"
+
+
+class DummyGlmOcrLMInputGenerator(DummyQwen2VLLMInputGenerator):
+    pass
+
+
+class DummyGlmOcrVisionEmbedInputGenerator(DummyVisionInputGenerator):
+    SUPPORTED_INPUT_NAMES = (
+        "hidden_states",
+        "attention_mask",
+        "rotary_pos_emb",
+    )
+
+    def __init__(
+        self,
+        task: str,
+        normalized_config: NormalizedVisionConfig,
+        batch_size: int = 1,
+        num_channels: int = DEFAULT_DUMMY_SHAPES["num_channels"],
+        width: int = 420,
+        height: int = 420,
+        **kwargs,
+    ):
+        self.batch_size = batch_size
+        self.height = height
+        self.width = width
+        self.num_channels = num_channels
+        self.temporal_patch_size = normalized_config.config.temporal_patch_size
+        self.patch_size = normalized_config.config.patch_size
+        if normalized_config.use_embed_dim:
+            self.embed_dim = normalized_config.hidden_size
+        else:
+            # patch_embed input channels = in_channels * temporal_patch * patch * patch (GLM-OCR in_channels=3)
+            self.embed_dim = self.num_channels * self.temporal_patch_size * self.patch_size * self.patch_size
+        self.num_heads = normalized_config.config.num_heads
+        self.spatial_merge_size = getattr(normalized_config.config, "spatial_merge_size", None)
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        grid_h, grid_w = self.height // self.patch_size, self.width // self.patch_size
+        grid_t = self.batch_size
+
+        if input_name == "hidden_states":
+            return self.random_float_tensor(
+                [grid_t * grid_h * grid_w, self.embed_dim], framework=framework, dtype=float_dtype
+            )
+
+        if input_name == "attention_mask":
+            return self.random_mask_tensor(
+                [1, grid_t * grid_h * grid_w, grid_t * grid_h * grid_w], framework=framework, dtype=float_dtype
+            )
+
+        if input_name == "rotary_pos_emb":
+            dim = self.embed_dim // self.num_heads // 2
+            return self.random_float_tensor([grid_t * grid_h * grid_w, dim], framework=framework, dtype=float_dtype)
+
+
+@register_in_tasks_manager("glm_ocr", *["image-text-to-text"], library_name="transformers")
+class GlmOcrOpenVINOConfig(BaseVLMOpenVINOConfig):
+    SUPPORTED_BEHAVIORS = [m.value for m in GlmOcrConfigBehavior]
+    NORMALIZED_CONFIG_CLASS = NormalizedVisionConfig
+    DUMMY_INPUT_GENERATOR_CLASSES = (DummyGlmOcrVisionEmbedInputGenerator,)
+    MIN_TRANSFORMERS_VERSION = "5.0.0"
+
+    def __init__(
+        self,
+        config: "PretrainedConfig",
+        task: str = "feature-extraction",
+        int_dtype: str = "int64",
+        float_dtype: str = "fp32",
+        behavior: GlmOcrConfigBehavior = GlmOcrConfigBehavior.VISION_EMBEDDINGS,
+        preprocessors: Optional[List[Any]] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            config=config,
+            task=task,
+            int_dtype=int_dtype,
+            float_dtype=float_dtype,
+            preprocessors=preprocessors,
+        )
+        self._behavior = behavior
+        self._orig_config = config
+        if self._behavior == GlmOcrConfigBehavior.VISION_EMBEDDINGS and hasattr(config, "vision_config"):
+            self._config = config.vision_config
+            self._normalized_config = self.NORMALIZED_CONFIG_CLASS(self._config)
+            self._normalized_config.use_embed_dim = False
+        if self._behavior == GlmOcrConfigBehavior.VISION_EMBEDDINGS_MERGER and hasattr(config, "vision_config"):
+            self._config = config.vision_config
+            self._normalized_config = self.NORMALIZED_CONFIG_CLASS(self._config)
+            self._normalized_config.use_embed_dim = True
+
+    @staticmethod
+    def get_model_for_behavior(model, behavior: Union[str, GlmOcrConfigBehavior]):
+        if isinstance(behavior, str) and not isinstance(behavior, GlmOcrConfigBehavior):
+            behavior = GlmOcrConfigBehavior(behavior)
+
+        if behavior == GlmOcrConfigBehavior.LANGUAGE:
+            return model
+
+        if behavior == GlmOcrConfigBehavior.VISION_EMBEDDINGS:
+            vision_embeddings = _get_model_attribute(model, "visual").patch_embed
+            vision_embeddings.config = model.config.vision_config
+            return vision_embeddings
+
+        if behavior == GlmOcrConfigBehavior.VISION_EMBEDDINGS_MERGER:
+            vision_merger = _get_model_attribute(model, "visual")
+            vision_merger.config = model.config.vision_config
+            return vision_merger
+
+        if behavior == GlmOcrConfigBehavior.TEXT_EMBEDDINGS:
+            text_embedding = _get_model_attribute(model, "language_model").embed_tokens
+            text_embedding.config = model.config.text_config
+            return text_embedding
+
+    def with_behavior(
+        self,
+        behavior: Union[str, GlmOcrConfigBehavior],
+    ):
+        if isinstance(behavior, str) and not isinstance(behavior, GlmOcrConfigBehavior):
+            behavior = GlmOcrConfigBehavior(behavior)
+
+        if behavior == GlmOcrConfigBehavior.TEXT_EMBEDDINGS:
+            return get_vlm_text_embeddings_config(
+                "glm_ocr_text",
+                self._orig_config.text_config,
+                self.int_dtype,
+                self.float_dtype,
+            )
+
+        if behavior == GlmOcrConfigBehavior.LANGUAGE:
+            return get_vlm_text_generation_config(
+                "glm_ocr_text",
+                self._orig_config.text_config,
+                self.int_dtype,
+                self.float_dtype,
+                model_patcher=GlmOcrLanguageModelPatcher,
+                dummy_input_generator=DummyGlmOcrLMInputGenerator,
+                inputs_update={"position_ids": {1: "batch_size", 2: "sequence_length"}},
+            )
+
+        if behavior in (
+            GlmOcrConfigBehavior.VISION_EMBEDDINGS,
+            GlmOcrConfigBehavior.VISION_EMBEDDINGS_MERGER,
+        ):
+            return self.__class__(
+                self._orig_config,
+                task=self.task,
+                int_dtype=self.int_dtype,
+                float_dtype=self.float_dtype,
+                behavior=behavior,
+                preprocessors=self._preprocessors,
+            )
+
+    def patch_model_for_export(self, model: PreTrainedModel, model_kwargs: Optional[Dict[str, Any]] = None):
+        model_kwargs = model_kwargs or {}
+        if self._behavior == GlmOcrConfigBehavior.VISION_EMBEDDINGS_MERGER:
+            return GlmOcrVisionEmbMergerPatcher(self, model, model_kwargs)
+        if self._behavior == GlmOcrConfigBehavior.VISION_EMBEDDINGS:
+            return ModelPatcher(self, model, model_kwargs=model_kwargs)
+        return super().patch_model_for_export(model, model_kwargs)
+
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        if self._behavior == GlmOcrConfigBehavior.VISION_EMBEDDINGS:
+            return {"hidden_states": {0: "patch_thw_grid", 1: "patch_temporal_channels"}}
+        if self._behavior == GlmOcrConfigBehavior.VISION_EMBEDDINGS_MERGER:
+            return {
+                "hidden_states": {0: "sequence_length"},
+                "attention_mask": {1: "sequence_length", 2: "sequence_length"},
+                "rotary_pos_emb": {0: "sequence_length"},
+            }
+        return {}
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        if self._behavior in (
+            GlmOcrConfigBehavior.VISION_EMBEDDINGS,
+            GlmOcrConfigBehavior.VISION_EMBEDDINGS_MERGER,
+        ):
+            return {"last_hidden_state": {0: "seq_len"}}
+        return {}
 
 
 @register_in_tasks_manager(

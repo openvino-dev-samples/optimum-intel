@@ -256,6 +256,18 @@ def patch_cos_sin_cached_fp32(model):
 def eager_mask_without_vmap(*args, **kwargs) -> Optional[torch.Tensor]:
     kwargs.pop("allow_is_causal_skip", None)
     dtype = kwargs.get("dtype", torch.float32)
+    # Transformers >= 5 dropped `cache_position` and switched to `q_length` in mask_interface.
+    # Construct a compatibility `cache_position` for the older `sdpa_mask_without_vmap` helper.
+    if "cache_position" not in kwargs and "q_length" in kwargs:
+        q_length = kwargs.pop("q_length")
+        kv_offset = kwargs.get("kv_offset", 0)
+        q_offset = kwargs.pop("q_offset", 0)
+        device = kwargs.get("device", "cpu")
+        kwargs["cache_position"] = torch.arange(q_offset, q_offset + q_length, device=device)
+        kwargs.setdefault("kv_offset", kv_offset)
+        # strip v5-only kwargs that the legacy helper does not understand
+        for unknown in ("allow_is_bidirectional_skip", "allow_torch_fix", "use_vmap"):
+            kwargs.pop(unknown, None)
     mask = sdpa_mask_without_vmap(*args, allow_is_causal_skip=False, **kwargs)
     # we use torch.finfo(torch.float16).min instead torch.finfo(dtype).min to avoid an overflow but not
     # sure this is the right way to handle this, we are basically pretending that -65,504 is -inf
@@ -4417,6 +4429,201 @@ class Qwen2VLVisionEmbMergerPatcher(ModelPatcher):
         for block in self._model.blocks:
             block.forward = block._orig_forward
             block.attn.forward = block.attn._orig_forward
+
+
+class GlmOcrLanguageModelPatcher(OVDecoderModelPatcher):
+    def __init__(
+        self,
+        config: "OnnxConfig",
+        model: "PreTrainedModel",
+        model_kwargs: Dict[str, Any] = None,
+    ):
+        model.__orig_forward = model.forward
+
+        def forward_wrap(
+            self,
+            attention_mask,
+            position_ids=None,
+            past_key_values=None,
+            inputs_embeds=None,
+            input_ids=None,
+            use_cache=True,
+        ):
+            if is_transformers_version("<", "5"):
+                new_past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+            else:
+                new_past_key_values = DynamicCache(past_key_values)
+
+            result = self.__orig_forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=new_past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+            )
+            if past_key_values is not None:
+                result["past_key_values"] = postprocess_past_key_values(result["past_key_values"])
+            return result
+
+        model.forward = types.MethodType(forward_wrap, model)
+        super().__init__(config, model, model_kwargs)
+
+    def __enter__(self):
+        super().__enter__()
+        # Patch GlmOcrTextRotaryEmbedding.forward to make 3-D M-RoPE traceable.
+        # Original impl uses maybe_autocast + dynamic_rope_update which are unfriendly
+        # to torch.jit.trace. We reconstruct the math with fully static operations.
+        model = self._model
+        text_model = model.model.language_model if hasattr(model, "model") else model.language_model
+        rotary = text_model.rotary_emb
+        rotary._orig_forward = rotary.forward
+        mrope_section = list(rotary.mrope_section)
+        attention_scaling = float(getattr(rotary, "attention_scaling", 1.0))
+
+        def rotary_forward(self, x, position_ids):
+            # position_ids: [3, batch, seq]
+            inv_freq = self.inv_freq.float()
+            inv_freq_expanded = inv_freq[None, None, :, None].expand(3, position_ids.shape[1], -1, 1)
+            position_ids_expanded = position_ids[:, :, None, :].float()
+            freqs = (inv_freq_expanded @ position_ids_expanded).transpose(2, 3)
+            # apply M-RoPE sectioning statically
+            chunks = freqs.split(mrope_section, dim=-1)
+            freqs = torch.cat([chunk[i % 3] for i, chunk in enumerate(chunks)], dim=-1)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * attention_scaling
+            sin = emb.sin() * attention_scaling
+            return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+        rotary.forward = types.MethodType(rotary_forward, rotary)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+        self._model.forward = self._model.__orig_forward
+        text_model = (
+            self._model.model.language_model if hasattr(self._model, "model") else self._model.language_model
+        )
+        if hasattr(text_model.rotary_emb, "_orig_forward"):
+            text_model.rotary_emb.forward = text_model.rotary_emb._orig_forward
+
+
+class GlmOcrVisionEmbMergerPatcher(ModelPatcher):
+    """Patcher for GLM-OCR vision tower (GlmOcrVisionModel).
+
+    The tower internally relies on ``cu_seqlens`` with python-side ``.tolist()`` +
+    list-comprehension attention, which is not traceable. We replace the
+    block / attention forwards with a dense-``attention_mask`` version, mirror
+    Qwen2-VL's approach, and expose ``(hidden_states, attention_mask, rotary_pos_emb)``
+    as the OV inputs. ``patch_embed`` is exported separately as
+    ``vision_embeddings``; this patcher covers blocks + ``post_layernorm`` +
+    ``downsample`` + ``merger``.
+    """
+
+    def __init__(
+        self,
+        config: "OnnxConfig",
+        model: "PreTrainedModel",
+        model_kwargs: Dict[str, Any] = None,
+    ):
+        model.__orig_forward = model.forward
+
+        def image_embed_forward(
+            self, hidden_states: torch.Tensor, attention_mask: torch.Tensor, rotary_pos_emb: torch.Tensor
+        ) -> torch.Tensor:
+            emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+            position_embeddings = (emb.cos(), emb.sin())
+            for blk in self.blocks:
+                hidden_states = blk(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_embeddings=position_embeddings,
+                )
+            hidden_states = self.post_layernorm(hidden_states)
+            hidden_states = hidden_states.view(
+                -1, self.spatial_merge_size, self.spatial_merge_size, hidden_states.shape[-1]
+            )
+            hidden_states = hidden_states.permute(0, 3, 1, 2)
+            hidden_states = self.downsample(hidden_states).view(-1, self.config.out_hidden_size)
+            return self.merger(hidden_states)
+
+        model.forward = types.MethodType(image_embed_forward, model)
+        super().__init__(config, model, model_kwargs)
+
+    def __enter__(self):
+        patch_glm_ocr_vision_blocks(self._model)
+        super().__enter__()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+        self._model.forward = self._model.__orig_forward
+        for block in self._model.blocks:
+            block.forward = block._orig_forward
+            block.attn.forward = block.attn._orig_forward
+
+
+def patch_glm_ocr_vision_blocks(model):
+    def rotate_half(x):
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def apply_rotary_pos_emb_vision(q, k, cos, sin):
+        orig_q_dtype, orig_k_dtype = q.dtype, k.dtype
+        q, k = q.float(), k.float()
+        cos, sin = cos.unsqueeze(-2), sin.unsqueeze(-2)
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+        return q_embed.to(orig_q_dtype), k_embed.to(orig_k_dtype)
+
+    def sdpa_attn_forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs,
+    ):
+        seq_length = hidden_states.shape[0]
+        qkv = self.qkv(hidden_states) if hasattr(self, "qkv") else torch.cat(
+            (self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)), dim=-1
+        )
+        q, k, v = qkv.reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+
+        # GLM-OCR applies Q/K RMSNorm before rotary
+        if hasattr(self, "q_norm"):
+            q = self.q_norm(q)
+        if hasattr(self, "k_norm"):
+            k = self.k_norm(k)
+
+        cos, sin = position_embeddings
+        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
+
+        q = q.transpose(0, 1)
+        k = k.transpose(0, 1)
+        v = v.transpose(0, 1)
+        attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, attention_mask, dropout_p=0.0)
+        attn_output = attn_output.transpose(0, 1).reshape(seq_length, -1).contiguous()
+        attn_output = self.proj(attn_output)
+        return attn_output
+
+    def block_forward(
+        self,
+        hidden_states,
+        attention_mask,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        hidden_states = hidden_states + self.attn(
+            self.norm1(hidden_states),
+            attention_mask=attention_mask,
+            position_embeddings=position_embeddings,
+        )
+        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+        return hidden_states
+
+    for block in model.blocks:
+        block._orig_forward = block.forward
+        block.forward = types.MethodType(block_forward, block)
+        block.attn._orig_forward = block.attn.forward
+        block.attn.forward = types.MethodType(sdpa_attn_forward, block.attn)
 
 
 class Qwen2_5_VLVisionEmbMergerPatcher(ModelPatcher):

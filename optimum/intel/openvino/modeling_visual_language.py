@@ -190,7 +190,7 @@ class OVModelWithEmbedForCausalLM(OVModelForCausalLM):
             if past_len:
                 position_ids = position_ids[:, -inputs_embeds.shape[1] :]
 
-            if (self.config.model_type in ["qwen2_vl", "qwen3_vl"]) and position_ids.ndim != 3:
+            if (self.config.model_type in ["qwen2_vl", "qwen3_vl", "glm_ocr"]) and position_ids.ndim != 3:
                 position_ids = np.repeat(np.expand_dims(position_ids, 0), 3, axis=0)
 
             inputs["position_ids"] = position_ids
@@ -3824,6 +3824,350 @@ class _OVQwen3VLForCausalLM(OVModelForVisualCausalLM, Qwen3VLModel, Qwen3VLVisio
         return super().generate(*args, **kwargs)
 
 
+class _OVGlmOcrForCausalLM(OVModelForVisualCausalLM):
+    additional_parts = ["vision_embeddings_merger"]
+
+    def __init__(
+        self,
+        language_model: ov.Model,
+        text_embeddings: ov.Model,
+        vision_embeddings: ov.Model,
+        config: PretrainedConfig = None,
+        device: str = "CPU",
+        dynamic_shapes: bool = None,
+        ov_config: Optional[Dict[str, str]] = None,
+        model_save_dir: Optional[Union[str, Path, TemporaryDirectory]] = None,
+        quantization_config: Union[OVWeightQuantizationConfig, Dict] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            language_model=language_model,
+            text_embeddings=text_embeddings,
+            vision_embeddings=vision_embeddings,
+            config=config,
+            device=device,
+            dynamic_shapes=dynamic_shapes,
+            ov_config=ov_config,
+            model_save_dir=model_save_dir,
+            quantization_config=quantization_config,
+            **kwargs,
+        )
+        self.rope_deltas = None
+        vc = self.config.vision_config
+        head_dim = vc.hidden_size // vc.num_heads
+        # GLM-OCR vision RoPE dim = head_dim // 2 (same convention as Qwen2-VL)
+        self._rotary_pos_emb = VisionRotaryEmbedding(head_dim // 2)
+
+    # Adapted from transformers GlmOcrVisionModel.rot_pos_emb. Runs Python-side
+    # because it iterates over variable-length grid_thw which torch.jit.trace
+    # cannot capture.
+    def rot_pos_emb(self, grid_thw):
+        spatial_merge_size = self.config.vision_config.spatial_merge_size
+        pos_ids = []
+        for t, h, w in grid_thw:
+            hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
+            hpos_ids = hpos_ids.reshape(
+                h // spatial_merge_size, spatial_merge_size, w // spatial_merge_size, spatial_merge_size
+            ).permute(0, 2, 1, 3).flatten()
+            wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
+            wpos_ids = wpos_ids.reshape(
+                h // spatial_merge_size, spatial_merge_size, w // spatial_merge_size, spatial_merge_size
+            ).permute(0, 2, 1, 3).flatten()
+            pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
+        pos_ids = torch.cat(pos_ids, dim=0)
+        max_grid_size = grid_thw[:, 1:].max()
+        rotary_pos_emb_full = self._rotary_pos_emb(max_grid_size)
+        return rotary_pos_emb_full[pos_ids].flatten(1)
+
+    def get_vision_embeddings(self, pixel_values, grid_thw, **kwargs):
+        # pixel_values here is the flattened patch tensor produced by the
+        # Glm46VImageProcessor (shape [grid_thw.prod().sum(), C*tp*p*p]).
+        hidden_states = torch.from_numpy(self.vision_embeddings(pixel_values).last_hidden_state)
+        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+
+        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
+            dim=0, dtype=torch.int32
+        )
+        cu_seqlens = torch.nn.functional.pad(cu_seqlens, (1, 0), value=0)
+        seq_len = hidden_states.shape[0]
+        attention_mask = torch.full((1, seq_len, seq_len), float("-inf"), dtype=torch.float32)
+        for i in range(1, len(cu_seqlens)):
+            attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = 0.0
+
+        res = self.vision_embeddings_merger(
+            hidden_states.numpy(), attention_mask=attention_mask, rotary_pos_emb=rotary_pos_emb
+        ).last_hidden_state
+        return res
+
+    # Adapted verbatim from transformers GlmOcrModel.get_rope_index (Python-side).
+    def get_rope_index(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        mm_token_type_ids: Optional[torch.IntTensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        import itertools
+
+        if video_grid_thw is not None:
+            video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
+            video_grid_thw = video_grid_thw.clone()
+            video_grid_thw[:, 0] = 1
+        spatial_merge_size = self.config.vision_config.spatial_merge_size
+
+        mrope_position_deltas = []
+        position_ids = torch.zeros(
+            3, input_ids.shape[0], input_ids.shape[1], dtype=input_ids.dtype, device=input_ids.device
+        )
+        grid_iters = {
+            1: iter(image_grid_thw) if image_grid_thw is not None else None,
+            2: iter(video_grid_thw) if video_grid_thw is not None else None,
+        }
+
+        for batch_idx, current_input_ids in enumerate(input_ids):
+            input_token_type = mm_token_type_ids[batch_idx]
+            if attention_mask is not None:
+                current_input_ids = current_input_ids[attention_mask[batch_idx].bool()]
+                input_token_type = input_token_type[attention_mask[batch_idx].bool()]
+
+            input_type_group = []
+            for key, group in itertools.groupby(enumerate(input_token_type.tolist()), lambda x: x[1]):
+                g = list(group)
+                input_type_group.append((key, g[0][0], g[-1][0] + 1))
+
+            current_pos = 0
+            llm_pos_ids_list = []
+            for modality_type, start_idx, end_idx in input_type_group:
+                if modality_type == 0:
+                    text_len = end_idx - start_idx
+                    llm_pos_ids_list.append(
+                        torch.arange(text_len, device=input_ids.device).view(1, -1).expand(3, -1) + current_pos
+                    )
+                    current_pos += text_len
+                else:
+                    grid_thw = next(grid_iters[modality_type])
+                    llm_grid_t = int(grid_thw[0].item())
+                    llm_grid_h = int(grid_thw[1].item()) // spatial_merge_size
+                    llm_grid_w = int(grid_thw[2].item()) // spatial_merge_size
+                    position_temporal = torch.arange(llm_grid_t, device=input_ids.device)
+                    position_width = torch.arange(llm_grid_w, device=input_ids.device) + current_pos
+                    position_height = torch.arange(llm_grid_h, device=input_ids.device) + current_pos
+                    position_width = position_width.repeat(llm_grid_h * llm_grid_t)
+                    position_height = position_height.repeat_interleave(llm_grid_w).repeat(llm_grid_t)
+                    position_temporal = position_temporal.repeat_interleave(llm_grid_h * llm_grid_w) + current_pos
+                    llm_pos_ids_list.append(torch.stack([position_temporal, position_height, position_width], dim=0))
+                    current_pos += max(int(grid_thw[1].item()), int(grid_thw[2].item())) // spatial_merge_size
+            llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+            if attention_mask is not None:
+                position_ids[:, batch_idx, attention_mask[batch_idx].bool()] = llm_positions.to(position_ids.device)
+            else:
+                position_ids[:, batch_idx] = llm_positions.to(position_ids.device)
+            mrope_position_deltas.append(llm_positions.max() + 1 - len(current_input_ids))
+        mrope_position_deltas = torch.tensor(mrope_position_deltas, device=input_ids.device).unsqueeze(1)
+        return position_ids, mrope_position_deltas
+
+    def merge_vision_text_embeddings(
+        self,
+        vision_embeds,
+        inputs_embeds,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        **kwargs,
+    ):
+        image_features = torch.from_numpy(vision_embeds) if isinstance(vision_embeds, np.ndarray) else vision_embeds
+        inputs_embeds = torch.from_numpy(inputs_embeds) if isinstance(inputs_embeds, np.ndarray) else inputs_embeds
+        # GLM-OCR uses the same image_token_id for image and video placeholders
+        # (see GlmOcrModel.get_placeholder_mask in transformers).
+        image_token_id = self.config.image_token_id
+        special_image_mask = (input_ids == image_token_id).unsqueeze(-1)
+        special_image_mask = special_image_mask.expand_as(inputs_embeds).to(inputs_embeds.device)
+        image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
+        return inputs_embeds, attention_mask, position_ids
+
+    def get_multimodal_embeddings(
+        self,
+        input_ids,
+        pixel_values=None,
+        attention_mask=None,
+        position_ids=None,
+        pixel_values_videos=None,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        mm_token_type_ids=None,
+        cache_position=None,
+        **kwargs,
+    ):
+        inputs_embeds = torch.from_numpy(self.get_text_embeddings(input_ids))
+        if pixel_values is not None and input_ids.shape[1] != 1:
+            image_embeds = torch.from_numpy(self.get_vision_embeddings(pixel_values, image_grid_thw))
+            image_mask = input_ids == self.config.image_token_id
+            inputs_embeds[image_mask] = image_embeds.to(inputs_embeds.dtype)
+        if pixel_values_videos is not None and input_ids.shape[1] != 1:
+            video_embeds = torch.from_numpy(self.get_vision_embeddings(pixel_values_videos, video_grid_thw))
+            # GLM-OCR overloads image_token_id for video placeholders too
+            video_mask = input_ids == self.config.image_token_id
+            inputs_embeds[video_mask] = video_embeds.to(inputs_embeds.dtype)
+
+        # Build 3-D M-RoPE position_ids. Ignore any incoming 2-D position_ids from
+        # the generation loop; GLM-OCR's text model needs [3, batch, seq].
+        needs_mrope_recompute = (
+            self.rope_deltas is None
+            or (cache_position is not None and cache_position[0] == 0)
+            or (position_ids is None or position_ids.ndim != 3)
+        )
+        if needs_mrope_recompute and input_ids is not None and mm_token_type_ids is not None \
+                and (image_grid_thw is not None or video_grid_thw is not None):
+            position_ids, rope_deltas = self.get_rope_index(
+                input_ids, mm_token_type_ids, image_grid_thw, video_grid_thw,
+                attention_mask if (attention_mask is not None and attention_mask.ndim == 2) else None,
+            )
+            self.rope_deltas = rope_deltas
+        elif position_ids is None or position_ids.ndim != 3:
+            batch_size, seq_length = inputs_embeds.shape[0], inputs_embeds.shape[1]
+            if cache_position is not None:
+                seq_pos = cache_position.view(1, -1).expand(batch_size, -1)
+            else:
+                seq_pos = torch.arange(seq_length, device=inputs_embeds.device).view(1, -1).expand(batch_size, -1)
+            if self.rope_deltas is not None:
+                delta = self.rope_deltas.to(seq_pos.device)
+                if delta.shape[0] != batch_size:
+                    delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
+                seq_pos = seq_pos + delta
+            position_ids = seq_pos.unsqueeze(0).expand(3, -1, -1)
+
+        return inputs_embeds, attention_mask, position_ids
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        cache_position=None,
+        position_ids=None,
+        use_cache=True,
+        pixel_values=None,
+        pixel_values_videos=None,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        mm_token_type_ids=None,
+        **kwargs,
+    ):
+        if past_key_values is not None and cache_position is not None:
+            if inputs_embeds is not None and input_ids.shape[1] == 0:
+                inputs_embeds = inputs_embeds[:, -cache_position.shape[0] :]
+            elif inputs_embeds is not None:
+                input_ids = input_ids[:, -cache_position.shape[0] :]
+            elif input_ids.shape[1] != cache_position.shape[0]:
+                input_ids = input_ids[:, cache_position]
+
+        if cache_position is not None and cache_position[0] != 0:
+            pixel_values = None
+            pixel_values_videos = None
+
+        if (
+            inputs_embeds is not None
+            and cache_position is not None
+            and len(cache_position) == inputs_embeds.shape[1]
+        ):
+            model_inputs = {"inputs_embeds": inputs_embeds, "input_ids": None}
+        else:
+            model_inputs = {"input_ids": input_ids, "inputs_embeds": None}
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": use_cache,
+                "attention_mask": attention_mask,
+                "pixel_values": pixel_values,
+                "pixel_values_videos": pixel_values_videos,
+                "image_grid_thw": image_grid_thw,
+                "video_grid_thw": video_grid_thw,
+                "mm_token_type_ids": mm_token_type_ids,
+                "cache_position": cache_position,
+            }
+        )
+        return model_inputs
+
+    def forward(
+        self,
+        input_ids,
+        pixel_values=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        image_sizes=None,
+        attention_mask=None,
+        position_ids=None,
+        image_bound=None,
+        tgt_sizes=None,
+        pixel_values_videos=None,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        rope_deltas=None,
+        mm_token_type_ids=None,
+        **kwargs,
+    ):
+        result = super().forward(
+            input_ids,
+            pixel_values,
+            past_key_values,
+            inputs_embeds,
+            image_sizes,
+            attention_mask,
+            position_ids,
+            image_bound,
+            tgt_sizes,
+            pixel_values_videos,
+            image_grid_thw,
+            video_grid_thw,
+            rope_deltas,
+            mm_token_type_ids=mm_token_type_ids,
+            **kwargs,
+        )
+        return QWen2VLModelOutputWithPast(
+            logits=result.logits, past_key_values=result.past_key_values, rope_deltas=rope_deltas
+        )
+
+    def generate(self, *args, **kwargs):
+        self.rope_deltas = None
+        return super().generate(*args, **kwargs)
+
+    @staticmethod
+    def preprocess_inputs(
+        text: Optional[str] = None,
+        image: Optional["Image"] = None,
+        processor: Optional[AutoImageProcessor] = None,
+        tokenizer: Optional[PreTrainedTokenizer] = None,
+        config: Optional[PretrainedConfig] = None,
+        video: Optional["VideoInput"] = None,
+        audio: Optional[np.ndarray] = None,
+    ):
+        if processor is None:
+            raise ValueError("Processor is required.")
+        if audio is not None:
+            raise ValueError("Audio input is not supported")
+        if video is not None:
+            raise ValueError("Video input is not supported")
+        content = []
+        if image is not None:
+            content.append({"type": "image", "image": image} if not isinstance(image, str) else {"type": "image", "url": image})
+        content.append({"type": "text", "text": text or ""})
+        messages = [{"role": "user", "content": content}]
+        inputs = processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+        inputs.pop("token_type_ids", None)
+        return inputs
+
+
 class _OVMaira2ForCausalLM(_OVLlavaForCausalLM):
     @staticmethod
     def preprocess_inputs(
@@ -4824,4 +5168,6 @@ MODEL_TYPE_TO_CLS_MAPPING = {
     "llama4": _OVLlama4ForCausalLM,
     "qwen3_vl": _OVQwen3VLForCausalLM,
     "minicpmo": _OVMiniCPMOForCausalLM,
+    "glm_ocr": _OVGlmOcrForCausalLM,
+    "glm_ocr_text": _OVGlmOcrForCausalLM,
 }

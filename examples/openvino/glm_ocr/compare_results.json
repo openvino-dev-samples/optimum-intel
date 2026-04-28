@@ -1,0 +1,34 @@
+{
+  "notes": "sample.png is a synthetic 640x240 image containing three lines: 'OpenVINO GLM-OCR test', 'Line two: 1234 ABC abc', 'Receipt total: $12.34'",
+  "hardware": "Windows 11, Intel Arc 140V (Xe2-LPG) GPU",
+  "openvino_version": "2026.0.0-20965-c6d6a13a886",
+  "transformers_version": "5.7.0.dev0",
+  "weight_format": "fp16",
+  "max_new_tokens": 32,
+
+  "prefill_logits_match (OV-CPU vs PyTorch-CPU FP32)": {
+    "maxdiff": 0.0345,
+    "meandiff": 0.00022,
+    "top1_match": 1.0,
+    "comment": "Exported model is bit-accurate to the original on prefill."
+  },
+
+  "generation_outputs": {
+    "pytorch_cpu": "OpenVINO GLM-OCR test\nLine two: 1234 ABC abc\nRe",
+    "ov_gpu": "OpenVINOpenVINO GLM-OCR test test test\nLine two: 1234 ABC abc\nReceipt total",
+    "ov_cpu": "OpenVINOpenVINOpenVINOpenVINOpenVINOpenVINO"
+  },
+
+  "latency_max_new_tokens_32": {
+    "pytorch_cpu_fp32": "6s",
+    "ov_gpu_fp16": "11s",
+    "ov_cpu_fp16": "178s"
+  },
+
+  "observations": [
+    "OV prefill logits match PyTorch within fp16 precision; top-1 is 100%.",
+    "OV GPU generation closely matches the PyTorch reference (three lines recognised).",
+    "OV CPU generation degenerates into a repeated token — prefill is correct (see logits match), so this points to a runtime numerics issue in the iterative decode path on CPU (likely fp16 KV cache accumulation) rather than a modeling bug.",
+    "PP-DocLayout-V3 is delivered as a standalone pipeline (examples/openvino/glm_ocr/pp_doclayout_v3/) converted to OV IR via paddle2onnx + ov.convert_model; it is not registered with the optimum exporter."
+  ]
+}

@@ -4027,8 +4027,20 @@ class GlmOcrConfigBehavior(str, enum.Enum):
     TEXT_EMBEDDINGS = "text_embeddings"
 
 
-class DummyGlmOcrLMInputGenerator(DummyQwen2VLLMInputGenerator):
-    pass
+class DummyGlmOcrLMInputGenerator(DummyTextInputGenerator):
+    """Emit 4-row position_ids for the GLM-OCR text decoder.
+
+    GlmOcrTextModel.forward consumes position_ids of shape [4, batch, seq]:
+    row 0 is the 1-D text position (drives the causal-mask helper), rows
+    1..3 are the 3-D multimodal RoPE positions (temporal / height / width).
+    See transformers/models/glm_ocr/modeling_glm_ocr.py::GlmOcrTextModel.forward.
+    """
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        generated_input = super().generate(input_name, framework, int_dtype, float_dtype)
+        if input_name == "position_ids":
+            return generated_input.unsqueeze(0).expand(4, -1, -1)
+        return generated_input
 
 
 class DummyGlmOcrVisionEmbedInputGenerator(DummyVisionInputGenerator):
@@ -4162,7 +4174,11 @@ class GlmOcrOpenVINOConfig(BaseVLMOpenVINOConfig):
                 self.float_dtype,
                 model_patcher=GlmOcrLanguageModelPatcher,
                 dummy_input_generator=DummyGlmOcrLMInputGenerator,
-                inputs_update={"position_ids": {1: "batch_size", 2: "sequence_length"}},
+                # Axis 0 of position_ids holds the M-RoPE rows (4 for GLM-OCR:
+                # [text | temporal | height | width]); mark it dynamic so the
+                # exported graph accepts both the 4-row shape and any legacy
+                # 3-row callers.
+                inputs_update={"position_ids": {0: "rope_rows", 1: "batch_size", 2: "sequence_length"}},
             )
 
         if behavior in (

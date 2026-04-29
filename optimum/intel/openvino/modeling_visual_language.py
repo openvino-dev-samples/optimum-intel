@@ -188,10 +188,20 @@ class OVModelWithEmbedForCausalLM(OVModelForCausalLM):
                 position_ids = np.cumsum(attention_mask, axis=1) - 1
                 position_ids[attention_mask == 0] = 1
             if past_len:
-                position_ids = position_ids[:, -inputs_embeds.shape[1] :]
+                # Slice along the sequence axis — for 2-D that is axis 1, for the
+                # [3/4, batch, seq] M-RoPE tensors used by qwen2_vl / qwen3_vl /
+                # glm_ocr that is axis 2.
+                if position_ids.ndim == 2:
+                    position_ids = position_ids[:, -inputs_embeds.shape[1] :]
+                else:
+                    position_ids = position_ids[..., -inputs_embeds.shape[1] :]
 
-            if (self.config.model_type in ["qwen2_vl", "qwen3_vl", "glm_ocr"]) and position_ids.ndim != 3:
+            if (self.config.model_type in ["qwen2_vl", "qwen3_vl"]) and position_ids.ndim != 3:
                 position_ids = np.repeat(np.expand_dims(position_ids, 0), 3, axis=0)
+            elif self.config.model_type == "glm_ocr" and position_ids.ndim != 3:
+                # GLM-OCR expects 4 rows: [text, temporal, height, width].
+                pid2d = position_ids
+                position_ids = np.stack([pid2d, pid2d, pid2d, pid2d], axis=0)
 
             inputs["position_ids"] = position_ids
 
@@ -3998,45 +4008,61 @@ class _OVGlmOcrForCausalLM(OVModelForVisualCausalLM):
         video_grid_thw=None,
         mm_token_type_ids=None,
         cache_position=None,
+        past_key_values=None,
         **kwargs,
     ):
         inputs_embeds = torch.from_numpy(self.get_text_embeddings(input_ids))
-        if pixel_values is not None and input_ids.shape[1] != 1:
+        past_length = (
+            self.language_model._get_past_length(past_key_values)
+            if past_key_values is not None
+            else 0
+        )
+
+        if pixel_values is not None and past_length == 0:
             image_embeds = torch.from_numpy(self.get_vision_embeddings(pixel_values, image_grid_thw))
             image_mask = input_ids == self.config.image_token_id
             inputs_embeds[image_mask] = image_embeds.to(inputs_embeds.dtype)
-        if pixel_values_videos is not None and input_ids.shape[1] != 1:
+        if pixel_values_videos is not None and past_length == 0:
             video_embeds = torch.from_numpy(self.get_vision_embeddings(pixel_values_videos, video_grid_thw))
             # GLM-OCR overloads image_token_id for video placeholders too
             video_mask = input_ids == self.config.image_token_id
             inputs_embeds[video_mask] = video_embeds.to(inputs_embeds.dtype)
 
-        # Build 3-D M-RoPE position_ids. Ignore any incoming 2-D position_ids from
-        # the generation loop; GLM-OCR's text model needs [3, batch, seq].
-        needs_mrope_recompute = (
-            self.rope_deltas is None
-            or (cache_position is not None and cache_position[0] == 0)
-            or (position_ids is None or position_ids.ndim != 3)
-        )
-        if needs_mrope_recompute and input_ids is not None and mm_token_type_ids is not None \
+        # Build 4-row M-RoPE position_ids: [text | temporal | height | width].
+        # The GlmOcrTextModel splits this back apart (text_position_ids drives the
+        # causal-mask helper; rows 1..3 feed the 3-D RoPE). See
+        # transformers/models/glm_ocr/modeling_glm_ocr.py::GlmOcrTextModel.forward.
+        batch_size = inputs_embeds.shape[0]
+        seq_length = inputs_embeds.shape[1]
+        device = inputs_embeds.device
+
+        if past_length == 0 and mm_token_type_ids is not None \
                 and (image_grid_thw is not None or video_grid_thw is not None):
-            position_ids, rope_deltas = self.get_rope_index(
-                input_ids, mm_token_type_ids, image_grid_thw, video_grid_thw,
+            vision_positions, rope_deltas = self.get_rope_index(
+                input_ids,
+                mm_token_type_ids,
+                image_grid_thw,
+                video_grid_thw,
                 attention_mask if (attention_mask is not None and attention_mask.ndim == 2) else None,
             )
             self.rope_deltas = rope_deltas
-        elif position_ids is None or position_ids.ndim != 3:
-            batch_size, seq_length = inputs_embeds.shape[0], inputs_embeds.shape[1]
-            if cache_position is not None:
-                seq_pos = cache_position.view(1, -1).expand(batch_size, -1)
-            else:
-                seq_pos = torch.arange(seq_length, device=inputs_embeds.device).view(1, -1).expand(batch_size, -1)
-            if self.rope_deltas is not None:
-                delta = self.rope_deltas.to(seq_pos.device)
-                if delta.shape[0] != batch_size:
-                    delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
-                seq_pos = seq_pos + delta
-            position_ids = seq_pos.unsqueeze(0).expand(3, -1, -1)
+            text_positions = torch.arange(seq_length, device=device).view(1, -1).expand(batch_size, -1)
+        else:
+            # Decode step: text positions run from ``past_length`` contiguously
+            # and each RoPE row is text_positions + rope_deltas (constant from prefill).
+            text_positions = (
+                torch.arange(past_length, past_length + seq_length, device=device)
+                .view(1, -1)
+                .expand(batch_size, -1)
+            )
+            if self.rope_deltas is None:
+                self.rope_deltas = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
+            delta = self.rope_deltas.to(device)
+            if delta.shape[0] != batch_size:
+                delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
+            vision_positions = (text_positions + delta).unsqueeze(0).expand(3, -1, -1)
+
+        position_ids = torch.cat([text_positions.unsqueeze(0), vision_positions], dim=0)  # [4, batch, seq]
 
         return inputs_embeds, attention_mask, position_ids
 
@@ -4056,27 +4082,29 @@ class _OVGlmOcrForCausalLM(OVModelForVisualCausalLM):
         mm_token_type_ids=None,
         **kwargs,
     ):
-        if past_key_values is not None and cache_position is not None:
-            if inputs_embeds is not None and input_ids.shape[1] == 0:
-                inputs_embeds = inputs_embeds[:, -cache_position.shape[0] :]
-            elif inputs_embeds is not None:
-                input_ids = input_ids[:, -cache_position.shape[0] :]
-            elif input_ids.shape[1] != cache_position.shape[0]:
-                input_ids = input_ids[:, cache_position]
+        # transformers>=5 does not hand us ``cache_position`` for VLMs; infer
+        # the past length from the stateful OV LM instead so the decode steps
+        # correctly slim ``input_ids`` down to the single newly-generated token
+        # (otherwise the LM re-processes the whole prefix every step).
+        past_length = self.language_model._get_past_length(past_key_values) if past_key_values is not None else 0
 
-        if cache_position is not None and cache_position[0] != 0:
+        if past_length > 0:
+            # Keep only the tokens that have not been processed by the KV cache.
+            if attention_mask is not None and past_length + 1 > input_ids.shape[1]:
+                input_discount = max(attention_mask.shape[1] - past_length, 1)
+                input_ids = input_ids[:, -input_discount:]
+            elif past_length < input_ids.shape[1]:
+                input_ids = input_ids[:, past_length:]
+            else:
+                input_ids = input_ids[:, -1:]
+
+            # Vision features are already baked into the KV cache — clear the
+            # image inputs so we don't re-run the vision tower every step.
             pixel_values = None
             pixel_values_videos = None
+            mm_token_type_ids = None
 
-        if (
-            inputs_embeds is not None
-            and cache_position is not None
-            and len(cache_position) == inputs_embeds.shape[1]
-        ):
-            model_inputs = {"inputs_embeds": inputs_embeds, "input_ids": None}
-        else:
-            model_inputs = {"input_ids": input_ids, "inputs_embeds": None}
-
+        model_inputs = {"input_ids": input_ids, "inputs_embeds": None}
         model_inputs.update(
             {
                 "position_ids": position_ids,

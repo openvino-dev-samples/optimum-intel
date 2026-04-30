@@ -436,6 +436,29 @@ _DEFAULT_4BIT_WQ_CONFIGS = {
         "dataset": "contextual",
         "scale_estimation": True,
     },
+    "black-forest-labs/FLUX.2-klein-4B": {
+        "quantization_configs": {
+            # Transformer's pos_embed/aten::outer MatMul nodes have channel_size=1 and cannot be
+            # grouped at group_size=128; group_size_fallback="ignore" leaves those few ops in fp16.
+            "transformer": {
+                "bits": 4,
+                "sym": False,
+                "group_size": 128,
+                "ratio": 0.8,
+                "group_size_fallback": "ignore",
+            },
+            "text_encoder": {
+                "bits": 4,
+                "sym": False,
+                "group_size": 128,
+                "ratio": 0.8,
+                "group_size_fallback": "ignore",
+            },
+            # Keep VAE at int8 — the decode subgraph is small and int4 hurts quality disproportionately.
+            "vae_encoder": {"bits": 8, "sym": False},
+            "vae_decoder": {"bits": 8, "sym": False},
+        },
+    },
 }
 
 _DEFAULT_8BIT_WQ_CONFIGS = {
@@ -447,6 +470,7 @@ _DEFAULT_8BIT_WQ_CONFIGS = {
 model_id_aliases = [
     ("meta-llama/Meta-Llama-3.1-8B-Instruct", "meta-llama/Llama-3.1-8B-Instruct"),
     ("meta-llama/Meta-Llama-3.1-8B", "meta-llama/Llama-3.1-8B"),
+    ("black-forest-labs/FLUX.2-klein-4B", "black-forest-labs/FLUX.2-klein-9B"),
 ]
 for m_id_1, m_id_2 in model_id_aliases:
     _DEFAULT_4BIT_WQ_CONFIGS[m_id_2] = _DEFAULT_4BIT_WQ_CONFIGS[m_id_1]

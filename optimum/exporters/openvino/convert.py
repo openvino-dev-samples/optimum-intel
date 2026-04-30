@@ -770,8 +770,8 @@ def export_from_model(
 
             np.savez(
                 output / "vae_bn_stats.npz",
-                running_mean=vae.bn.running_mean.cpu().numpy(),
-                running_var=vae.bn.running_var.cpu().numpy(),
+                running_mean=vae.bn.running_mean.cpu().float().numpy(),
+                running_var=vae.bn.running_var.cpu().float().numpy(),
             )
 
     _set_runtime_options(

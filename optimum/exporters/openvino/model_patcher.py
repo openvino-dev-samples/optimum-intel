@@ -8624,8 +8624,25 @@ class Flux2KleinTransformerModelPatcher(ModelPatcher):
             self._model.pos_embed.forward = self._model.pos_embed._orig_forward
 
 
-class Flux2KleinTextEncoderModelPatcher(ModelPatcher):
-    """Patcher for Qwen3ForCausalLM text encoder: wraps forward to output stacked hidden states."""
+def _flux2_klein_text_encoder_forward(self, input_ids, attention_mask=None, **kwargs):
+    """Run the wrapped Qwen3 forward with output_hidden_states=True, then stack the requested layers."""
+    import torch
+
+    outputs = self._orig_forward(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        output_hidden_states=True,
+        use_cache=False,
+        return_dict=True,
+    )
+    hidden_states = outputs.hidden_states
+    stacked = torch.stack([hidden_states[k] for k in self._hidden_states_layers], dim=1)
+    batch_size, num_channels, seq_len, hidden_dim = stacked.shape
+    return stacked.permute(0, 2, 1, 3).reshape(batch_size, seq_len, num_channels * hidden_dim)
+
+
+class Flux2KleinTextEncoderModelPatcher(SanaTextEncoderModelPatcher):
+    """Patcher for Qwen3 text encoder: reuses Sana's sdpa + eager-mask trace fix, then stacks hidden states."""
 
     def __init__(self, config, model, model_kwargs=None):
         super().__init__(config, model, model_kwargs)
@@ -8638,52 +8655,8 @@ class Flux2KleinTextEncoderModelPatcher(ModelPatcher):
         self._model.forward = types.MethodType(_flux2_klein_text_encoder_forward, self._model)
 
     def __exit__(self, exc_type, exc_value, traceback):
-        super().__exit__(exc_type, exc_value, traceback)
         if hasattr(self._model, "_orig_forward"):
             self._model.forward = self._model._orig_forward
+            del self._model._orig_forward
             del self._model._hidden_states_layers
-
-
-def _flux2_klein_text_encoder_forward(self, input_ids, attention_mask=None, **kwargs):
-    """Wrapped forward for Qwen3 text encoder — directly runs through layers bypassing mask utilities."""
-    import torch
-
-    # Directly run through model internals to avoid create_causal_mask issues during tracing
-    model = self.model  # Qwen3Model
-
-    # Embed tokens
-    hidden_states = model.embed_tokens(input_ids)
-
-    # Create position_ids
-    seq_length = input_ids.shape[1]
-    position_ids = torch.arange(seq_length, device=input_ids.device).unsqueeze(0)
-
-    # Get rotary embeddings
-    position_embeddings = model.rotary_emb(hidden_states, position_ids)
-
-    # Create simple causal mask for eager attention (no need for sdpa_mask_without_vmap)
-    # For prefill with no past KV, just use None (eager attention handles causality internally)
-    causal_mask = None
-
-    # Run through all layers, collecting hidden states
-    all_hidden_states = [hidden_states]
-    for decoder_layer in model.layers:
-        hidden_states = decoder_layer(
-            hidden_states,
-            attention_mask=causal_mask,
-            position_embeddings=position_embeddings,
-            position_ids=position_ids,
-            past_key_values=None,
-            use_cache=False,
-        )
-        all_hidden_states.append(hidden_states)
-
-    hidden_states = model.norm(hidden_states)
-    all_hidden_states.append(hidden_states)
-
-    # Stack hidden states from target layers
-    layers = self._hidden_states_layers
-    out = torch.stack([all_hidden_states[k] for k in layers], dim=1)
-    batch_size, num_channels, seq_len, hidden_dim = out.shape
-    prompt_embeds = out.permute(0, 2, 1, 3).reshape(batch_size, seq_len, num_channels * hidden_dim)
-    return prompt_embeds
+        super().__exit__(exc_type, exc_value, traceback)

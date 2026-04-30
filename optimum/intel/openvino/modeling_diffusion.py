@@ -1730,6 +1730,8 @@ class OVFlux2KleinPipeline(OVDiffusionPipeline, Flux2KleinPipeline):
             prompt_embeds = prompt_embeds.prompt_embeds
 
         prompt_embeds = torch.from_numpy(prompt_embeds) if not isinstance(prompt_embeds, torch.Tensor) else prompt_embeds
+        if dtype is not None or device is not None:
+            prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
         return prompt_embeds
 
     def _reshape_transformer(
@@ -1776,9 +1778,12 @@ class OVFlux2KleinPipeline(OVDiffusionPipeline, Flux2KleinPipeline):
     def _from_pretrained(cls, model_id, config, **kwargs):
         pipeline = super()._from_pretrained(model_id, config, **kwargs)
 
-        # Load VAE BN running stats for latent normalization
+        # Restore VAE BN running stats + config saved at export time so the parent pipeline
+        # can denormalize latents outside of the VAE forward pass.
         model_path = Path(model_id) if os.path.isdir(str(model_id)) else model_id
         bn_stats_path = Path(model_path) / "vae_bn_stats.npz"
+        batch_norm_eps = None
+        block_out_channels = None
         if bn_stats_path.exists():
             import numpy as np
 
@@ -1791,12 +1796,19 @@ class OVFlux2KleinPipeline(OVDiffusionPipeline, Flux2KleinPipeline):
 
             pipeline.vae.bn = _MockBN(bn_stats["running_mean"], bn_stats["running_var"])
 
-        # Store batch_norm_eps from VAE config
+            if "batch_norm_eps" in bn_stats.files:
+                batch_norm_eps = float(bn_stats["batch_norm_eps"])
+            if "block_out_channels" in bn_stats.files:
+                block_out_channels = list(map(int, bn_stats["block_out_channels"].tolist()))
+
         if not hasattr(pipeline.vae, "config"):
             class _MockVAEConfig:
-                batch_norm_eps = 1e-5
-                block_out_channels = [128, 256, 512, 512]
+                pass
             pipeline.vae.config = _MockVAEConfig()
+            pipeline.vae.config.batch_norm_eps = batch_norm_eps if batch_norm_eps is not None else 1e-5
+            pipeline.vae.config.block_out_channels = (
+                block_out_channels if block_out_channels is not None else [128, 256, 512, 512]
+            )
 
         return pipeline
 

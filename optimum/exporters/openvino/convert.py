@@ -763,17 +763,25 @@ def export_from_model(
 
         model.save_config(output)
 
-        # Save VAE BN running stats so the post-export pipeline can denormalize latents outside of
-        # the VAE forward pass (used by Flux2Klein; exported VAE decode subgraph does not include BN).
+        # Save VAE BN running stats + config so the post-export pipeline can denormalize latents
+        # outside of the VAE forward pass (used by Flux2Klein; exported VAE decode subgraph does not include BN).
         vae = getattr(model, "vae", None)
         if vae is not None and hasattr(vae, "bn") and hasattr(vae.bn, "running_mean"):
             import numpy as np
 
-            np.savez(
-                output / "vae_bn_stats.npz",
-                running_mean=vae.bn.running_mean.cpu().float().numpy(),
-                running_var=vae.bn.running_var.cpu().float().numpy(),
-            )
+            bn_save_kwargs = {
+                "running_mean": vae.bn.running_mean.cpu().float().numpy(),
+                "running_var": vae.bn.running_var.cpu().float().numpy(),
+            }
+            vae_config = getattr(vae, "config", None)
+            if vae_config is not None:
+                batch_norm_eps = getattr(vae_config, "batch_norm_eps", None)
+                if batch_norm_eps is not None:
+                    bn_save_kwargs["batch_norm_eps"] = np.array(float(batch_norm_eps), dtype=np.float32)
+                block_out_channels = getattr(vae_config, "block_out_channels", None)
+                if block_out_channels is not None:
+                    bn_save_kwargs["block_out_channels"] = np.array(list(block_out_channels), dtype=np.int64)
+            np.savez(output / "vae_bn_stats.npz", **bn_save_kwargs)
 
     _set_runtime_options(
         models_and_export_configs,

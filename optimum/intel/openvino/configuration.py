@@ -459,6 +459,29 @@ _DEFAULT_4BIT_WQ_CONFIGS = {
             "vae_decoder": {"bits": 8, "sym": False},
         },
     },
+    "black-forest-labs/FLUX.2-klein-9B": {
+        "quantization_configs": {
+            # Transformer's pos_embed/aten::outer MatMul nodes have channel_size=1 and cannot be
+            # grouped at group_size=128; group_size_fallback="ignore" leaves those few ops in fp16.
+            "transformer": {
+                "bits": 4,
+                "sym": False,
+                "group_size": 128,
+                "ratio": 0.8,
+                "group_size_fallback": "ignore",
+            },
+            "text_encoder": {
+                "bits": 4,
+                "sym": False,
+                "group_size": 128,
+                "ratio": 0.8,
+                "group_size_fallback": "ignore",
+            },
+            # Keep VAE at int8 — the decode subgraph is small and int4 hurts quality disproportionately.
+            "vae_encoder": {"bits": 8, "sym": False},
+            "vae_decoder": {"bits": 8, "sym": False},
+        },
+    },
 }
 
 _DEFAULT_8BIT_WQ_CONFIGS = {

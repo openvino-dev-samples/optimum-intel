@@ -31,7 +31,15 @@ from transformers.generation.logits_process import LogitsProcessorList
 from transformers.generation.stopping_criteria import StoppingCriteriaList
 from transformers.generation.utils import GenerateOutput, GenerationMode
 from transformers.modeling_outputs import CausalLMOutputWithPast, ModelOutput
-from transformers.models.mamba.modeling_mamba import MambaCache
+
+try:
+    from transformers.models.mamba.modeling_mamba import MambaCache
+except ImportError:
+    try:
+        from transformers.cache_utils import MambaCache
+    except ImportError:
+        MambaCache = None
+
 from transformers.utils.hub import PushToHubMixin
 
 from optimum.utils.normalized_config import NormalizedConfigManager
@@ -1047,7 +1055,10 @@ class OVGPTBigCodeForCausalLM(OVModelForCausalLM):
             return tuple(np.take(layer_past, beam_idx, 0) for layer_past in past_key_values)
 
 
-class OVCacheWithMambaStates(MambaCache):
+_MambaCacheBase = MambaCache if MambaCache is not None else object
+
+
+class OVCacheWithMambaStates(_MambaCacheBase):
     """
     Hybrid cache for Mamba and transformer blocks
 

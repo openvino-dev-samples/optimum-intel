@@ -1294,8 +1294,12 @@ class OVModelTransformer(OVPipelinePart):
         if pooled_projections is not None:
             model_inputs["pooled_projections"] = pooled_projections
         if img_ids is not None:
+            if img_ids.ndim == 3:
+                img_ids = img_ids[0]
             model_inputs["img_ids"] = img_ids
         if txt_ids is not None:
+            if txt_ids.ndim == 3:
+                txt_ids = txt_ids[0]
             model_inputs["txt_ids"] = txt_ids
         if guidance is not None:
             model_inputs["guidance"] = guidance
@@ -1740,6 +1744,93 @@ class OVFlux2KleinPipeline(OVDiffusionPipeline, Flux2KleinPipeline):
     main_input_name = "prompt"
     export_feature = "text-to-image"
     auto_model_class = Flux2KleinPipeline
+
+    @staticmethod
+    def _get_qwen3_prompt_embeds(
+        text_encoder,
+        tokenizer,
+        prompt,
+        dtype=None,
+        device=None,
+        max_sequence_length=512,
+        hidden_states_layers=(9, 18, 27),
+    ):
+        """Override to work with OV text encoder that directly outputs stacked prompt_embeds."""
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+
+        all_input_ids = []
+        all_attention_masks = []
+
+        for single_prompt in prompt:
+            messages = [{"role": "user", "content": single_prompt}]
+            text = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+            inputs = tokenizer(
+                text,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=max_sequence_length,
+            )
+            all_input_ids.append(inputs["input_ids"])
+            all_attention_masks.append(inputs["attention_mask"])
+
+        input_ids = torch.cat(all_input_ids, dim=0)
+        attention_mask = torch.cat(all_attention_masks, dim=0)
+
+        # OV text encoder directly returns prompt_embeds (already stacked from layers 9/18/27)
+        prompt_embeds = text_encoder(input_ids=input_ids, attention_mask=attention_mask)
+        if isinstance(prompt_embeds, dict):
+            prompt_embeds = prompt_embeds["prompt_embeds"]
+        elif hasattr(prompt_embeds, "prompt_embeds"):
+            prompt_embeds = prompt_embeds.prompt_embeds
+
+        prompt_embeds = torch.from_numpy(prompt_embeds) if not isinstance(prompt_embeds, torch.Tensor) else prompt_embeds
+        return prompt_embeds
+
+    def _reshape_transformer(
+        self,
+        model,
+        batch_size=-1,
+        height=-1,
+        width=-1,
+        num_images_per_prompt=-1,
+        tokenizer_max_length=-1,
+        num_frames=-1,
+    ):
+        """Override to use 4-dim IDs (axes_dims_rope=[32,32,32,32]) instead of 3."""
+        if batch_size == -1 or num_images_per_prompt == -1:
+            batch_size = -1
+        else:
+            batch_size *= num_images_per_prompt
+
+        height = height // self.vae_scale_factor if height > 0 else height
+        width = width // self.vae_scale_factor if width > 0 else width
+        packed_height_width = width * height if height > 0 and width > 0 else -1
+
+        shapes = {}
+        for inputs in model.inputs:
+            shapes[inputs] = inputs.get_partial_shape()
+            if inputs.get_any_name() in ["timestep", "guidance"]:
+                shapes[inputs][0] = batch_size
+            elif inputs.get_any_name() == "hidden_states":
+                in_channels = self.transformer.config.get("in_channels", 128)
+                shapes[inputs] = [batch_size, packed_height_width, in_channels]
+            elif inputs.get_any_name() == "img_ids":
+                shapes[inputs] = [packed_height_width, 4]
+            elif inputs.get_any_name() == "txt_ids":
+                shapes[inputs] = [-1, 4]
+            elif inputs.get_any_name() == "encoder_hidden_states":
+                shapes[inputs][0] = batch_size
+                shapes[inputs][1] = -1
+            else:
+                shapes[inputs][0] = batch_size
+        model.reshape(shapes)
+        return model
 
     @classmethod
     def _from_pretrained(cls, model_id, config, **kwargs):

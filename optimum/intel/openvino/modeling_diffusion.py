@@ -1685,8 +1685,14 @@ class OVFlux2KleinPipeline(OVDiffusionPipeline, Flux2KleinPipeline):
     export_feature = "text-to-image"
     auto_model_class = Flux2KleinPipeline
 
-    @staticmethod
+    # Layers baked into the exported text encoder graph by Flux2KleinTextEncoderModelPatcher.
+    # If the caller requests a different selection we must reject rather than silently return
+    # embeddings from the wrong layers.
+    _baked_text_encoder_out_layers = (9, 18, 27)
+
+    @classmethod
     def _get_qwen3_prompt_embeds(
+        cls,
         text_encoder,
         tokenizer,
         prompt,
@@ -1696,6 +1702,13 @@ class OVFlux2KleinPipeline(OVDiffusionPipeline, Flux2KleinPipeline):
         hidden_states_layers=(9, 18, 27),
     ):
         """Override to work with OV text encoder that directly outputs stacked prompt_embeds."""
+        if tuple(hidden_states_layers) != cls._baked_text_encoder_out_layers:
+            raise ValueError(
+                f"OVFlux2KleinPipeline was exported with hidden_states_layers="
+                f"{cls._baked_text_encoder_out_layers}, but {tuple(hidden_states_layers)} was requested. "
+                "Re-export the model with matching text_encoder_out_layers to change this selection."
+            )
+
         prompt = [prompt] if isinstance(prompt, str) else prompt
 
         all_input_ids = []
@@ -1722,7 +1735,7 @@ class OVFlux2KleinPipeline(OVDiffusionPipeline, Flux2KleinPipeline):
         input_ids = torch.cat(all_input_ids, dim=0)
         attention_mask = torch.cat(all_attention_masks, dim=0)
 
-        # OV text encoder directly returns prompt_embeds (already stacked from layers 9/18/27)
+        # OV text encoder directly returns prompt_embeds (already stacked from baked-in layers)
         prompt_embeds = text_encoder(input_ids=input_ids, attention_mask=attention_mask)
         if isinstance(prompt_embeds, dict):
             prompt_embeds = prompt_embeds["prompt_embeds"]
@@ -1730,8 +1743,9 @@ class OVFlux2KleinPipeline(OVDiffusionPipeline, Flux2KleinPipeline):
             prompt_embeds = prompt_embeds.prompt_embeds
 
         prompt_embeds = torch.from_numpy(prompt_embeds) if not isinstance(prompt_embeds, torch.Tensor) else prompt_embeds
-        if dtype is not None or device is not None:
-            prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+        if dtype is None:
+            dtype = getattr(text_encoder, "dtype", torch.bfloat16)
+        prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
         return prompt_embeds
 
     def _reshape_transformer(
@@ -1776,10 +1790,13 @@ class OVFlux2KleinPipeline(OVDiffusionPipeline, Flux2KleinPipeline):
 
     @classmethod
     def _from_pretrained(cls, model_id, config, **kwargs):
+        import types
+
         pipeline = super()._from_pretrained(model_id, config, **kwargs)
 
         # Restore VAE BN running stats + config saved at export time so the parent pipeline
-        # can denormalize latents outside of the VAE forward pass.
+        # can denormalize latents outside of the VAE forward pass. Defaults mirror the
+        # upstream AutoencoderKLFlux2 signature (batch_norm_eps=1e-4, block_out_channels=(128,256,512,512)).
         model_path = Path(model_id) if os.path.isdir(str(model_id)) else model_id
         bn_stats_path = Path(model_path) / "vae_bn_stats.npz"
         batch_norm_eps = None
@@ -1788,27 +1805,21 @@ class OVFlux2KleinPipeline(OVDiffusionPipeline, Flux2KleinPipeline):
             import numpy as np
 
             bn_stats = np.load(bn_stats_path)
-
-            class _MockBN:
-                def __init__(self, running_mean, running_var):
-                    self.running_mean = torch.from_numpy(running_mean.copy())
-                    self.running_var = torch.from_numpy(running_var.copy())
-
-            pipeline.vae.bn = _MockBN(bn_stats["running_mean"], bn_stats["running_var"])
-
+            pipeline.vae.bn = types.SimpleNamespace(
+                running_mean=torch.from_numpy(bn_stats["running_mean"].copy()),
+                running_var=torch.from_numpy(bn_stats["running_var"].copy()),
+            )
             if "batch_norm_eps" in bn_stats.files:
                 batch_norm_eps = float(bn_stats["batch_norm_eps"])
             if "block_out_channels" in bn_stats.files:
                 block_out_channels = list(map(int, bn_stats["block_out_channels"].tolist()))
 
         if not hasattr(pipeline.vae, "config"):
-            class _MockVAEConfig:
-                pass
-            pipeline.vae.config = _MockVAEConfig()
-            pipeline.vae.config.batch_norm_eps = batch_norm_eps if batch_norm_eps is not None else 1e-5
-            pipeline.vae.config.block_out_channels = (
-                block_out_channels if block_out_channels is not None else [128, 256, 512, 512]
-            )
+            pipeline.vae.config = types.SimpleNamespace()
+        pipeline.vae.config.batch_norm_eps = batch_norm_eps if batch_norm_eps is not None else 1e-4
+        pipeline.vae.config.block_out_channels = (
+            block_out_channels if block_out_channels is not None else [128, 256, 512, 512]
+        )
 
         return pipeline
 

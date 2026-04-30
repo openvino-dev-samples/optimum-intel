@@ -8625,17 +8625,23 @@ class Flux2KleinTransformerModelPatcher(ModelPatcher):
 
 
 def _flux2_klein_text_encoder_forward(self, input_ids, attention_mask=None, **kwargs):
-    """Run the wrapped Qwen3 forward with output_hidden_states=True, then stack the requested layers."""
+    """Run Qwen3Model with output_hidden_states=True, then stack the requested layers.
+
+    Calls ``self.model`` (the inner ``Qwen3Model``) rather than ``self._orig_forward`` because
+    ``Qwen3ForCausalLM.forward`` is decorated with ``@can_return_tuple`` which unwraps to a
+    plain tuple inside ``torch.jit.trace`` and loses the ``.hidden_states`` attribute.
+    ``Qwen3Model.forward`` always returns ``BaseModelOutputWithPast``.
+    """
     import torch
 
-    outputs = self._orig_forward(
+    outputs = self.model(
         input_ids=input_ids,
         attention_mask=attention_mask,
         output_hidden_states=True,
         use_cache=False,
         return_dict=True,
     )
-    hidden_states = outputs.hidden_states
+    hidden_states = outputs.hidden_states if not isinstance(outputs, tuple) else outputs[-1]
     stacked = torch.stack([hidden_states[k] for k in self._hidden_states_layers], dim=1)
     batch_size, num_channels, seq_len, hidden_dim = stacked.shape
     return stacked.permute(0, 2, 1, 3).reshape(batch_size, seq_len, num_channels * hidden_dim)

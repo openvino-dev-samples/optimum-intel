@@ -1031,8 +1031,8 @@ def get_diffusion_models_for_export_ext(
 ):
     is_sdxl = pipeline.__class__.__name__.startswith("StableDiffusionXL")
     is_sd3 = pipeline.__class__.__name__.startswith("StableDiffusion3")
-    is_flux2_klein = pipeline.__class__.__name__.startswith("Flux2Klein")
-    is_flux = pipeline.__class__.__name__.startswith("Flux") and not is_flux2_klein
+    is_flux2_klein = pipeline.__class__.__name__ == "Flux2KleinPipeline"
+    is_flux = pipeline.__class__.__name__.startswith("Flux") and not pipeline.__class__.__name__.startswith("Flux2")
     is_sana = pipeline.__class__.__name__.startswith("Sana")
     is_ltx_video = pipeline.__class__.__name__.startswith("LTX")
     is_sd = pipeline.__class__.__name__.startswith("StableDiffusion") and not is_sd3

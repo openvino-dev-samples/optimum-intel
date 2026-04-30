@@ -475,37 +475,14 @@ def main_export(
         if loading_kwargs.get("torch_dtype") == "auto":
             loading_kwargs["torch_dtype"] = dtype
 
-        # ERNIE-Image needs special handling for tokenizer (TokenizersBackend requires transformers v5)
-        # and optional pe/pe_tokenizer components. Load components individually to avoid
-        # DiffusionPipeline.from_pretrained trying to resolve unsupported TokenizersBackend class.
         from diffusers import DiffusionPipeline as _DiffusionPipeline
 
         _diffusers_config = _DiffusionPipeline.load_config(model_name_or_path)
-        _is_ernie_image = _diffusers_config.get("_class_name") == "ErnieImagePipeline"
         _is_flux2_klein = _diffusers_config.get("_class_name") == "Flux2KleinPipeline"
-        if _is_ernie_image:
-            # Force float32 loading for ERNIE-Image to avoid bf16/fp32 conversion mismatches
-            loading_kwargs["torch_dtype"] = torch.float32
-            patch_16bit = False
 
     try:
         if library_name == "open_clip":
             model = _OpenClipForZeroShotImageClassification.from_pretrained(model_name_or_path, cache_dir=cache_dir)
-        elif library_name == "diffusers" and _is_ernie_image:
-            from diffusers import ErnieImagePipeline, ErnieImageTransformer2DModel, AutoencoderKLFlux2
-            from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
-            from transformers import AutoModel, PreTrainedTokenizerFast
-
-            _dtype_kwarg = {k: v for k, v in loading_kwargs.items() if k == "torch_dtype"}
-            model = ErnieImagePipeline(
-                text_encoder=AutoModel.from_pretrained(str(Path(model_name_or_path) / "text_encoder"), **_dtype_kwarg),
-                tokenizer=PreTrainedTokenizerFast.from_pretrained(str(Path(model_name_or_path) / "tokenizer")),
-                transformer=ErnieImageTransformer2DModel.from_pretrained(str(Path(model_name_or_path) / "transformer"), **_dtype_kwarg),
-                vae=AutoencoderKLFlux2.from_pretrained(str(Path(model_name_or_path) / "vae"), **_dtype_kwarg),
-                scheduler=FlowMatchEulerDiscreteScheduler.from_pretrained(str(Path(model_name_or_path) / "scheduler")),
-                pe=None,
-                pe_tokenizer=None,
-            )
         elif library_name == "diffusers" and _is_flux2_klein:
             from diffusers import Flux2KleinPipeline
 

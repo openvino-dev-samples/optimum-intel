@@ -149,6 +149,8 @@ from .model_patcher import (
     DBRXModelPatcher,
     DeciLMModelPatcher,
     DeepseekPatcher,
+    ErnieImageTransformerModelPatcher,
+    ErnieImageVAEPatcher,
     FalconModelPatcher,
     FluxTransfromerModelPatcher,
     Gemma2ModelPatcher,
@@ -313,6 +315,18 @@ def init_model_configs():
     if is_diffusers_available() and "text-to-video" not in TasksManager._DIFFUSERS_TASKS_TO_MODEL_MAPPINGS:
         TasksManager._DIFFUSERS_TASKS_TO_MODEL_MAPPINGS["text-to-video"] = {}
         TasksManager._DIFFUSERS_TASKS_TO_MODEL_MAPPINGS["text-to-video"]["ltx-video"] = "LTXPipeline"
+    if is_diffusers_available():
+        TasksManager._DIFFUSERS_TASKS_TO_MODEL_MAPPINGS.setdefault("text-to-image", {})
+        TasksManager._DIFFUSERS_TASKS_TO_MODEL_MAPPINGS["text-to-image"]["ernie-image"] = "ErnieImagePipeline"
+        # Register ministral3 config type needed by ERNIE-Image text encoder (Mistral3 model)
+        try:
+            from transformers import MistralConfig
+            from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+            if "ministral3" not in getattr(CONFIG_MAPPING, "_extra_content", {}):
+                CONFIG_MAPPING.register("ministral3", MistralConfig)
+        except Exception:
+            pass
 
     supported_model_types = [
         "_SUPPORTED_MODEL_TYPE",
@@ -2671,6 +2685,154 @@ class FluxTransformerOpenVINOConfig(SD3TransformerOpenVINOConfig):
         if getattr(self._normalized_config, "guidance_embeds", False):
             common_inputs["guidance"] = {0: "batch_size"}
         return common_inputs
+
+
+class DummyErnieImageTransformerInputGenerator(DummyVisionInputGenerator):
+    SUPPORTED_INPUT_NAMES = (
+        "hidden_states",
+        "text_bth",
+        "text_lens",
+    )
+
+    def __init__(
+        self,
+        task: str,
+        normalized_config: NormalizedVisionConfig,
+        batch_size: int = DEFAULT_DUMMY_SHAPES["batch_size"],
+        num_channels: int = DEFAULT_DUMMY_SHAPES["num_channels"],
+        width: int = DEFAULT_DUMMY_SHAPES["width"] // 4,
+        height: int = DEFAULT_DUMMY_SHAPES["height"] // 4,
+        **kwargs,
+    ):
+        super().__init__(task, normalized_config, batch_size, num_channels, width, height, **kwargs)
+        self.in_channels = getattr(normalized_config, "in_channels", 128)
+        self.text_in_dim = getattr(normalized_config.config, "text_in_dim", 3072)
+        self.text_seq_len = 16
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        import torch
+
+        if input_name == "hidden_states":
+            return self.random_float_tensor(
+                [self.batch_size, self.in_channels, self.height, self.width], framework=framework, dtype=float_dtype
+            )
+        if input_name == "text_bth":
+            return self.random_float_tensor(
+                [self.batch_size, self.text_seq_len, self.text_in_dim], framework=framework, dtype=float_dtype
+            )
+        if input_name == "text_lens":
+            return torch.full([self.batch_size], self.text_seq_len, dtype=DTYPE_MAPPER.pt(int_dtype))
+        return super().generate(input_name, framework, int_dtype, float_dtype)
+
+
+class DummyErnieImageTimestepInputGenerator(DummyTimestepInputGenerator):
+    SUPPORTED_INPUT_NAMES = ("timestep",)
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        return self.random_float_tensor([self.batch_size], framework=framework, dtype=float_dtype)
+
+
+@register_in_tasks_manager("ernie-image-transformer-2d", *["semantic-segmentation"], library_name="diffusers")
+class ErnieImageTransformerOpenVINOConfig(UNetOpenVINOConfig):
+    NORMALIZED_CONFIG_CLASS = NormalizedConfig.with_args(
+        image_size="sample_size",
+        num_channels="in_channels",
+        hidden_size="hidden_size",
+        vocab_size="num_attention_heads",
+        allow_new=True,
+    )
+    DUMMY_INPUT_GENERATOR_CLASSES = (
+        DummyErnieImageTransformerInputGenerator,
+        DummyErnieImageTimestepInputGenerator,
+    )
+    _MODEL_PATCHER = ErnieImageTransformerModelPatcher
+
+    @property
+    def inputs(self):
+        return {
+            "hidden_states": {0: "batch_size", 1: "in_channels", 2: "height", 3: "width"},
+            "timestep": {0: "batch_size"},
+            "text_bth": {0: "batch_size", 1: "text_sequence_length"},
+            "text_lens": {0: "batch_size"},
+        }
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "out_sample": {0: "batch_size", 1: "out_channels", 2: "height", 3: "width"},
+        }
+
+    def generate_dummy_inputs(self, framework: str = "pt", **kwargs):
+        # Skip UNetOnnxConfig's generate_dummy_inputs which has SD-specific encoder_hidden_states processing
+        dummy_inputs_generators = self._create_dummy_input_generator_classes(**kwargs)
+        dummy_inputs = {}
+        for input_name in self.inputs:
+            for dummy_input_gen in dummy_inputs_generators:
+                if dummy_input_gen.supports_input(input_name):
+                    dummy_inputs[input_name] = dummy_input_gen.generate(
+                        input_name, framework=framework,
+                    )
+                    break
+        return dummy_inputs
+
+    def rename_ambiguous_inputs(self, inputs):
+        return inputs
+
+
+@register_in_tasks_manager("ernie-image-vae-encoder", *["semantic-segmentation"], library_name="diffusers")
+class ErnieImageVaeEncoderOpenVINOConfig(VaeEncoderOnnxConfig):
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "sample": {0: "batch_size", 2: "height", 3: "width"},
+        }
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "latent_parameters": {0: "batch_size", 2: "height_latent", 3: "width_latent"},
+        }
+
+
+@register_in_tasks_manager("ernie-image-vae-decoder", *["semantic-segmentation"], library_name="diffusers")
+class ErnieImageVaeDecoderOpenVINOConfig(VaeDecoderOnnxConfig):
+    _MODEL_PATCHER = ErnieImageVAEPatcher
+
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "latent_sample": {0: "batch_size", 2: "height_latent", 3: "width_latent"},
+        }
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "sample": {0: "batch_size", 2: "height", 3: "width"},
+        }
+
+
+@register_in_tasks_manager("ernie-image-text-encoder", *["feature-extraction"], library_name="diffusers")
+class ErnieImageTextEncoderOpenVINOConfig(CLIPTextOpenVINOConfig):
+    NORMALIZED_CONFIG_CLASS = NormalizedConfig.with_args(
+        vocab_size="vocab_size",
+        num_layers="num_hidden_layers",
+        allow_new=True,
+    )
+
+    def __init__(self, config, task="feature-extraction", int_dtype="int64", float_dtype="fp32", preprocessors=None):
+        # Mistral3Config has attributes under text_config; flatten them for normalized config
+        if hasattr(config, "text_config") and not hasattr(config, "num_hidden_layers"):
+            text_config = config.text_config
+            config.num_hidden_layers = text_config.num_hidden_layers
+            config.hidden_size = text_config.hidden_size
+            config.vocab_size = text_config.vocab_size
+        super().__init__(config, task=task, int_dtype=int_dtype, float_dtype=float_dtype, preprocessors=preprocessors)
+
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "input_ids": {0: "batch_size", 1: "sequence_length"},
+        }
 
 
 class LTXVaeDummyInputGenerator(DummyVisionInputGenerator):

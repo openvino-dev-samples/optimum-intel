@@ -120,6 +120,11 @@ if is_diffusers_version(">=", "0.33.0"):
 else:
     SanaSprintPipeline = object
 
+try:
+    from diffusers import ErnieImagePipeline
+except ImportError:
+    ErnieImagePipeline = object
+
 
 if is_diffusers_version(">=", "0.35.0"):
     from diffusers.models.cache_utils import CacheMixin
@@ -808,6 +813,9 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
                 shapes[inputs] = [batch_size, -1, 3] if is_diffusers_version("<", "0.31.0") else [-1, 3]
             elif inputs.get_any_name() in ["height", "width", "num_frames", "rope_interpolation_scale"]:
                 shapes[inputs] = inputs.get_partial_shape()
+            elif inputs.get_any_name() in ["text_bth", "text_lens"]:
+                # ERNIE-Image specific: text_bth [B, T, D], text_lens [B]
+                shapes[inputs][0] = batch_size
             else:
                 shapes[inputs][0] = batch_size
                 shapes[inputs][1] = -1  # text_encoder_3 may have vary input length
@@ -1264,6 +1272,8 @@ class OVModelTransformer(OVPipelinePart):
         rope_interpolation_scale: Optional[Union[Tuple[float, float, float], torch.Tensor]] = None,
         video_coords: Optional[torch.Tensor] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
+        text_bth: Optional[torch.Tensor] = None,
+        text_lens: Optional[torch.Tensor] = None,
         return_dict: bool = True,
     ):
         self.compile()
@@ -1271,8 +1281,10 @@ class OVModelTransformer(OVPipelinePart):
         model_inputs = {
             "hidden_states": hidden_states,
             "timestep": timestep,
-            "encoder_hidden_states": encoder_hidden_states,
         }
+
+        if encoder_hidden_states is not None:
+            model_inputs["encoder_hidden_states"] = encoder_hidden_states
 
         if pooled_projections is not None:
             model_inputs["pooled_projections"] = pooled_projections
@@ -1283,6 +1295,10 @@ class OVModelTransformer(OVPipelinePart):
         if guidance is not None:
             model_inputs["guidance"] = guidance
 
+        if text_bth is not None:
+            model_inputs["text_bth"] = text_bth
+        if text_lens is not None:
+            model_inputs["text_lens"] = text_lens
         if encoder_attention_mask is not None:
             model_inputs["encoder_attention_mask"] = encoder_attention_mask
         if num_frames is not None:
@@ -1663,6 +1679,58 @@ class OVLTXPipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, LTXPipel
     auto_model_class = LTXPipeline
 
 
+class OVErnieImagePipeline(OVDiffusionPipeline, ErnieImagePipeline):
+    main_input_name = "prompt"
+    export_feature = "text-to-image"
+    auto_model_class = ErnieImagePipeline
+
+    @classmethod
+    def _from_pretrained(cls, model_id, config, **kwargs):
+        # Register ministral3 config for ERNIE-Image text encoder (Mistral3 uses ministral3 sub-config)
+        try:
+            from transformers import MistralConfig
+            from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+            if "ministral3" not in getattr(CONFIG_MAPPING, "_extra_content", {}):
+                CONFIG_MAPPING.register("ministral3", MistralConfig)
+        except Exception:
+            pass
+
+        # Override tokenizer loading: ERNIE-Image uses TokenizersBackend which requires transformers v5
+        tokenizer_config = config.get("tokenizer", (None, None))
+        if tokenizer_config[1] == "TokenizersBackend":
+            from transformers import PreTrainedTokenizerFast
+
+            model_path = Path(model_id) if os.path.isdir(str(model_id)) else model_id
+            tokenizer_path = Path(model_path) / "tokenizer" if (Path(model_path) / "tokenizer").is_dir() else model_path
+            kwargs["tokenizer"] = PreTrainedTokenizerFast.from_pretrained(str(tokenizer_path))
+
+        # Skip pe and pe_tokenizer (optional components)
+        if "pe" not in kwargs:
+            kwargs["pe"] = None
+        if "pe_tokenizer" not in kwargs:
+            kwargs["pe_tokenizer"] = None
+
+        pipeline = super()._from_pretrained(model_id, config, **kwargs)
+
+        # Load VAE BN running stats for latent unnormalization
+        model_path = Path(model_id) if os.path.isdir(str(model_id)) else model_id
+        bn_stats_path = Path(model_path) / "vae_bn_stats.npz"
+        if bn_stats_path.exists():
+            import numpy as np
+
+            bn_stats = np.load(bn_stats_path)
+
+            class _MockBN:
+                def __init__(self, running_mean, running_var):
+                    self.running_mean = torch.from_numpy(running_mean.copy())
+                    self.running_var = torch.from_numpy(running_var.copy())
+
+            pipeline.vae.bn = _MockBN(bn_stats["running_mean"], bn_stats["running_var"])
+
+        return pipeline
+
+
 SUPPORTED_OV_PIPELINES = [
     OVStableDiffusionPipeline,
     OVStableDiffusionImg2ImgPipeline,
@@ -1747,6 +1815,10 @@ if is_diffusers_version(">=", "0.32.0"):
 if is_diffusers_version(">=", "0.33.0"):
     SUPPORTED_OV_PIPELINES.append(OVSanaSprintPipeline)
     OV_TEXT2IMAGE_PIPELINES_MAPPING["sana-sprint"] = OVSanaSprintPipeline
+
+if ErnieImagePipeline is not object:
+    SUPPORTED_OV_PIPELINES.append(OVErnieImagePipeline)
+    OV_TEXT2IMAGE_PIPELINES_MAPPING["ernie-image"] = OVErnieImagePipeline
 
 SUPPORTED_OV_PIPELINES_MAPPINGS = [
     OV_TEXT2IMAGE_PIPELINES_MAPPING,

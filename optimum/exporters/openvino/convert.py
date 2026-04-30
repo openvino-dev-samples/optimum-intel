@@ -763,6 +763,17 @@ def export_from_model(
 
         model.save_config(output)
 
+        # Save VAE BN running stats for ERNIE-Image (used for latent unnormalization outside of VAE forward pass)
+        vae = getattr(model, "vae", None)
+        if vae is not None and hasattr(vae, "bn") and hasattr(vae.bn, "running_mean"):
+            import numpy as np
+
+            np.savez(
+                output / "vae_bn_stats.npz",
+                running_mean=vae.bn.running_mean.cpu().numpy(),
+                running_var=vae.bn.running_var.cpu().numpy(),
+            )
+
     _set_runtime_options(
         models_and_export_configs,
         task,
@@ -1014,6 +1025,7 @@ def get_diffusion_models_for_export_ext(
     is_flux = pipeline.__class__.__name__.startswith("Flux")
     is_sana = pipeline.__class__.__name__.startswith("Sana")
     is_ltx_video = pipeline.__class__.__name__.startswith("LTX")
+    is_ernie_image = pipeline.__class__.__name__.startswith("ErnieImage")
     is_sd = pipeline.__class__.__name__.startswith("StableDiffusion") and not is_sd3
     is_lcm = pipeline.__class__.__name__.startswith("LatentConsistencyModel")
 
@@ -1039,6 +1051,8 @@ def get_diffusion_models_for_export_ext(
         models_for_export = get_sana_models_for_export(pipeline, exporter, int_dtype, float_dtype)
     elif is_ltx_video:
         models_for_export = get_ltx_video_models_for_export(pipeline, exporter, int_dtype, float_dtype)
+    elif is_ernie_image:
+        models_for_export = get_ernie_image_models_for_export(pipeline, exporter, int_dtype, float_dtype)
     else:
         raise ValueError(f"Unsupported pipeline type `{pipeline.__class__.__name__}` provided")
     return None, models_for_export
@@ -1113,6 +1127,71 @@ def get_ltx_video_models_for_export(pipeline, exporter, int_dtype, float_dtype):
         vae_decoder.config, int_dtype=int_dtype, float_dtype=float_dtype
     )
     vae_decoder_export_config.runtime_options = {"ACTIVATIONS_SCALE_FACTOR": "8.0"}
+    models_for_export["vae_decoder"] = (vae_decoder, vae_decoder_export_config)
+
+    return models_for_export
+
+
+def get_ernie_image_models_for_export(pipeline, exporter, int_dtype, float_dtype):
+    models_for_export = {}
+
+    # Text Encoder
+    text_encoder = pipeline.text_encoder
+    text_encoder.config.output_hidden_states = True
+    export_config_constructor = TasksManager.get_exporter_config_constructor(
+        model=text_encoder,
+        exporter=exporter,
+        library_name="diffusers",
+        task="feature-extraction",
+        model_type="ernie-image-text-encoder",
+    )
+    text_encoder_export_config = export_config_constructor(
+        text_encoder.config, int_dtype=int_dtype, float_dtype=float_dtype
+    )
+    models_for_export["text_encoder"] = (text_encoder, text_encoder_export_config)
+
+    # Transformer
+    transformer = pipeline.transformer
+    export_config_constructor = TasksManager.get_exporter_config_constructor(
+        model=transformer,
+        exporter=exporter,
+        library_name="diffusers",
+        task="semantic-segmentation",
+        model_type="ernie-image-transformer-2d",
+    )
+    transformer_export_config = export_config_constructor(
+        transformer.config, int_dtype=int_dtype, float_dtype=float_dtype
+    )
+    models_for_export["transformer"] = (transformer, transformer_export_config)
+
+    # VAE Encoder
+    vae_encoder = copy.deepcopy(pipeline.vae)
+    vae_encoder.forward = lambda sample: {"latent_parameters": vae_encoder.encode(x=sample)["latent_dist"].parameters}
+    vae_config_constructor = TasksManager.get_exporter_config_constructor(
+        model=vae_encoder,
+        exporter=exporter,
+        library_name="diffusers",
+        task="semantic-segmentation",
+        model_type="ernie-image-vae-encoder",
+    )
+    vae_encoder_export_config = vae_config_constructor(
+        vae_encoder.config, int_dtype=int_dtype, float_dtype=float_dtype
+    )
+    models_for_export["vae_encoder"] = (vae_encoder, vae_encoder_export_config)
+
+    # VAE Decoder
+    vae_decoder = copy.deepcopy(pipeline.vae)
+    vae_decoder.forward = lambda latent_sample: vae_decoder.decode(z=latent_sample)
+    vae_config_constructor = TasksManager.get_exporter_config_constructor(
+        model=vae_decoder,
+        exporter=exporter,
+        library_name="diffusers",
+        task="semantic-segmentation",
+        model_type="ernie-image-vae-decoder",
+    )
+    vae_decoder_export_config = vae_config_constructor(
+        vae_decoder.config, int_dtype=int_dtype, float_dtype=float_dtype
+    )
     models_for_export["vae_decoder"] = (vae_decoder, vae_decoder_export_config)
 
     return models_for_export

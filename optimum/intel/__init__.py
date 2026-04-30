@@ -114,6 +114,7 @@ except OptionalDependencyNotAvailable:
             "OVPipelineForInpainting",
             "OVPipelineForText2Video",
             "OVDiffusionPipeline",
+            "OVErnieImagePipeline",
         ]
     )
 else:
@@ -141,6 +142,7 @@ else:
             "OVPipelineForInpainting",
             "OVPipelineForText2Video",
             "OVDiffusionPipeline",
+            "OVErnieImagePipeline",
         ]
     )
 
@@ -209,6 +211,7 @@ if TYPE_CHECKING:
     except OptionalDependencyNotAvailable:
         from .utils.dummy_openvino_and_diffusers_objects import (
             OVDiffusionPipeline,
+            OVErnieImagePipeline,
             OVFluxPipeline,
             OVLatentConsistencyModelImg2ImgPipeline,
             OVLatentConsistencyModelPipeline,
@@ -230,6 +233,7 @@ if TYPE_CHECKING:
     else:
         from .openvino import (
             OVDiffusionPipeline,
+            OVErnieImagePipeline,
             OVFluxPipeline,
             OVLatentConsistencyModelImg2ImgPipeline,
             OVLatentConsistencyModelPipeline,

@@ -8584,3 +8584,126 @@ class Lfm2MoeModelPatcher(Lfm2ModelPatcher):
                 if isinstance(sparse_moe_block.experts, Lfm2MoeExperts):
                     lfm2_moe_experts = sparse_moe_block.experts
                     lfm2_moe_experts.forward = lfm2_moe_experts._orig_forward
+
+
+def _ernie_image_rope_float32(pos, dim, theta):
+    """RoPE computation using float32 instead of float64 for OpenVINO compatibility."""
+    import torch
+
+    assert dim % 2 == 0
+    scale = torch.arange(0, dim, 2, dtype=torch.float32, device=pos.device) / dim
+    omega = 1.0 / (theta**scale)
+    out = torch.einsum("...n,d->...nd", pos.float(), omega)
+    return out
+
+
+def _ernie_image_embed_nd3_forward(self, ids):
+    """Patched EmbedND3 forward using float32 rope (same output format as original)."""
+    import torch
+
+    emb = torch.cat([_ernie_image_rope_float32(ids[..., i], self.axes_dim[i], self.theta) for i in range(3)], dim=-1)
+    emb = emb.unsqueeze(2)  # [B, S, 1, head_dim//2]
+    return torch.stack([emb, emb], dim=-1).reshape(*emb.shape[:-1], -1)  # [B, S, 1, head_dim]
+
+
+class _ErnieImagePatchedAttnProcessor:
+    """Attention processor using F.scaled_dot_product_attention directly for OpenVINO tracing."""
+
+    def __call__(self, attn, hidden_states, attention_mask=None, freqs_cis=None):
+        import torch
+        import torch.nn.functional as F
+
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(hidden_states)
+        value = attn.to_v(hidden_states)
+
+        query = query.unflatten(-1, (attn.heads, -1))
+        key = key.unflatten(-1, (attn.heads, -1))
+        value = value.unflatten(-1, (attn.heads, -1))
+
+        if attn.norm_q is not None:
+            query = attn.norm_q(query)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
+
+        if freqs_cis is not None:
+            rot_dim = freqs_cis.shape[-1]
+            q, q_pass = query[..., :rot_dim], query[..., rot_dim:]
+            k, k_pass = key[..., :rot_dim], key[..., rot_dim:]
+            cos_ = torch.cos(freqs_cis).to(query.dtype)
+            sin_ = torch.sin(freqs_cis).to(query.dtype)
+            q1, q2 = q.chunk(2, dim=-1)
+            q_rotated = torch.cat((-q2, q1), dim=-1)
+            query = torch.cat((q * cos_ + q_rotated * sin_, q_pass), dim=-1)
+            k1, k2 = k.chunk(2, dim=-1)
+            k_rotated = torch.cat((-k2, k1), dim=-1)
+            key = torch.cat((k * cos_ + k_rotated * sin_, k_pass), dim=-1)
+
+        dtype = query.dtype
+        query, key = query.to(dtype), key.to(dtype)
+
+        if attention_mask is not None and attention_mask.ndim == 2:
+            attention_mask = attention_mask[:, None, None, :]
+
+        hidden_states = F.scaled_dot_product_attention(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=False,
+        ).transpose(1, 2)
+
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.to(dtype)
+        output = attn.to_out[0](hidden_states)
+        return output
+
+
+class ErnieImageTransformerModelPatcher(ModelPatcher):
+    def __enter__(self):
+        super().__enter__()
+        # Patch pos_embed to use float32 rope (same output format, no float64)
+        self._model.pos_embed._orig_forward = self._model.pos_embed.forward
+        self._model.pos_embed.forward = types.MethodType(_ernie_image_embed_nd3_forward, self._model.pos_embed)
+
+        # Replace attention processors to use F.scaled_dot_product_attention directly
+        self._orig_processors = {}
+        for i, layer in enumerate(self._model.layers):
+            attn = layer.self_attention
+            self._orig_processors[i] = attn.processor
+            attn.set_processor(_ErnieImagePatchedAttnProcessor())
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+        if hasattr(self._model.pos_embed, "_orig_forward"):
+            self._model.pos_embed.forward = self._model.pos_embed._orig_forward
+
+        for i, layer in enumerate(self._model.layers):
+            attn = layer.self_attention
+            if i in self._orig_processors:
+                attn.set_processor(self._orig_processors[i])
+
+
+class ErnieImageVAEPatcher(ModelPatcher):
+    def __enter__(self):
+        super().__enter__()
+        # Patch nearest-exact interpolation to nearest for OpenVINO compatibility
+        for up_block in self._model.decoder.up_blocks:
+            if hasattr(up_block, "upsamplers") and up_block.upsamplers is not None:
+                for upsampler in up_block.upsamplers:
+                    if hasattr(upsampler, "conv"):
+                        upsampler._orig_interpolate_mode = getattr(upsampler, "interpolate_mode", None)
+                        # Check for nearest-exact mode in the upsample function
+                        if hasattr(upsampler, "interpolation_mode"):
+                            if upsampler.interpolation_mode == "nearest-exact":
+                                upsampler.interpolation_mode = "nearest"
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+        for up_block in self._model.decoder.up_blocks:
+            if hasattr(up_block, "upsamplers") and up_block.upsamplers is not None:
+                for upsampler in up_block.upsamplers:
+                    if hasattr(upsampler, "_orig_interpolate_mode") and upsampler._orig_interpolate_mode is not None:
+                        if hasattr(upsampler, "interpolation_mode"):
+                            upsampler.interpolation_mode = upsampler._orig_interpolate_mode

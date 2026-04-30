@@ -1022,7 +1022,8 @@ def get_diffusion_models_for_export_ext(
 ):
     is_sdxl = pipeline.__class__.__name__.startswith("StableDiffusionXL")
     is_sd3 = pipeline.__class__.__name__.startswith("StableDiffusion3")
-    is_flux = pipeline.__class__.__name__.startswith("Flux")
+    is_flux2_klein = pipeline.__class__.__name__.startswith("Flux2Klein")
+    is_flux = pipeline.__class__.__name__.startswith("Flux") and not is_flux2_klein
     is_sana = pipeline.__class__.__name__.startswith("Sana")
     is_ltx_video = pipeline.__class__.__name__.startswith("LTX")
     is_ernie_image = pipeline.__class__.__name__.startswith("ErnieImage")
@@ -1045,6 +1046,8 @@ def get_diffusion_models_for_export_ext(
 
     elif is_sd3:
         models_for_export = get_sd3_models_for_export(pipeline, exporter, int_dtype, float_dtype)
+    elif is_flux2_klein:
+        models_for_export = get_flux2_klein_models_for_export(pipeline, exporter, int_dtype, float_dtype)
     elif is_flux:
         models_for_export = get_flux_models_for_export(pipeline, exporter, int_dtype, float_dtype)
     elif is_sana:
@@ -1188,6 +1191,72 @@ def get_ernie_image_models_for_export(pipeline, exporter, int_dtype, float_dtype
         library_name="diffusers",
         task="semantic-segmentation",
         model_type="ernie-image-vae-decoder",
+    )
+    vae_decoder_export_config = vae_config_constructor(
+        vae_decoder.config, int_dtype=int_dtype, float_dtype=float_dtype
+    )
+    models_for_export["vae_decoder"] = (vae_decoder, vae_decoder_export_config)
+
+    return models_for_export
+
+
+def get_flux2_klein_models_for_export(pipeline, exporter, int_dtype, float_dtype):
+    models_for_export = {}
+
+    # Text Encoder (Qwen3ForCausalLM — wrapped to output stacked hidden states)
+    text_encoder = pipeline.text_encoder
+    export_config_constructor = TasksManager.get_exporter_config_constructor(
+        model=text_encoder,
+        exporter=exporter,
+        library_name="diffusers",
+        task="feature-extraction",
+        model_type="flux2-klein-text-encoder",
+    )
+    text_encoder_export_config = export_config_constructor(
+        text_encoder.config, int_dtype=int_dtype, float_dtype=float_dtype
+    )
+    models_for_export["text_encoder"] = (text_encoder, text_encoder_export_config)
+
+    # Transformer (Flux2Transformer2DModel — distilled, no guidance input)
+    transformer = pipeline.transformer
+    export_config_constructor = TasksManager.get_exporter_config_constructor(
+        model=transformer,
+        exporter=exporter,
+        library_name="diffusers",
+        task="semantic-segmentation",
+        model_type="flux2-transformer-2d",
+    )
+    transformer_export_config = export_config_constructor(
+        transformer.config, int_dtype=int_dtype, float_dtype=float_dtype
+    )
+    # GPU precision overflow fix
+    transformer_export_config.runtime_options = {"ACTIVATIONS_SCALE_FACTOR": "8.0"}
+    models_for_export["transformer"] = (transformer, transformer_export_config)
+
+    # VAE Encoder
+    vae_encoder = copy.deepcopy(pipeline.vae)
+    vae_encoder.forward = lambda sample: {"latent_parameters": vae_encoder.encode(sample)["latent_dist"].parameters}
+    vae_config_constructor = TasksManager.get_exporter_config_constructor(
+        model=vae_encoder,
+        exporter=exporter,
+        library_name="diffusers",
+        task="semantic-segmentation",
+        model_type="flux2-klein-vae-encoder",
+    )
+    vae_encoder_export_config = vae_config_constructor(
+        vae_encoder.config, int_dtype=int_dtype, float_dtype=float_dtype
+    )
+    models_for_export["vae_encoder"] = (vae_encoder, vae_encoder_export_config)
+
+    # VAE Decoder
+    vae_decoder = copy.deepcopy(pipeline.vae)
+    vae_decoder.forward = lambda latent_sample: vae_decoder.decode(latent_sample, return_dict=False)
+    vae_config_constructor = TasksManager.get_exporter_config_constructor(
+        model=vae_decoder,
+        exporter=exporter,
+        library_name="diffusers",
+        task="semantic-segmentation",
+        model_type="flux2-klein-vae-decoder",
     )
     vae_decoder_export_config = vae_config_constructor(
         vae_decoder.config, int_dtype=int_dtype, float_dtype=float_dtype

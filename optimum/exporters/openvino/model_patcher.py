@@ -8707,3 +8707,79 @@ class ErnieImageVAEPatcher(ModelPatcher):
                     if hasattr(upsampler, "_orig_interpolate_mode") and upsampler._orig_interpolate_mode is not None:
                         if hasattr(upsampler, "interpolation_mode"):
                             upsampler.interpolation_mode = upsampler._orig_interpolate_mode
+
+
+def _flux2_pos_embed_float32(self, ids):
+    """Patched Flux2PosEmbed.forward using float32 instead of float64 for OpenVINO compatibility."""
+    import torch
+    from diffusers.models.embeddings import get_1d_rotary_pos_embed
+
+    cos_out = []
+    sin_out = []
+    pos = ids.float()
+    for i in range(len(self.axes_dim)):
+        cos, sin = get_1d_rotary_pos_embed(
+            self.axes_dim[i],
+            pos[..., i],
+            theta=self.theta,
+            repeat_interleave_real=True,
+            use_real=True,
+            freqs_dtype=torch.float32,
+        )
+        cos_out.append(cos)
+        sin_out.append(sin)
+    freqs_cos = torch.cat(cos_out, dim=-1).to(ids.device)
+    freqs_sin = torch.cat(sin_out, dim=-1).to(ids.device)
+    return freqs_cos, freqs_sin
+
+
+class Flux2KleinTransformerModelPatcher(ModelPatcher):
+    """Patcher for Flux2Transformer2DModel: patches RoPE to use float32."""
+
+    def __enter__(self):
+        super().__enter__()
+        self._model.pos_embed._orig_forward = self._model.pos_embed.forward
+        self._model.pos_embed.forward = types.MethodType(_flux2_pos_embed_float32, self._model.pos_embed)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+        if hasattr(self._model.pos_embed, "_orig_forward"):
+            self._model.pos_embed.forward = self._model.pos_embed._orig_forward
+
+
+class Flux2KleinTextEncoderModelPatcher(ModelPatcher):
+    """Patcher for Qwen3ForCausalLM text encoder: wraps forward to output stacked hidden states."""
+
+    def __init__(self, config, model, model_kwargs=None):
+        super().__init__(config, model, model_kwargs)
+        self._hidden_states_layers = (9, 18, 27)
+
+    def __enter__(self):
+        super().__enter__()
+        self._model._orig_forward = self._model.forward
+        self._model._hidden_states_layers = self._hidden_states_layers
+        self._model.forward = types.MethodType(_flux2_klein_text_encoder_forward, self._model)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+        if hasattr(self._model, "_orig_forward"):
+            self._model.forward = self._model._orig_forward
+            del self._model._hidden_states_layers
+
+
+def _flux2_klein_text_encoder_forward(self, input_ids, attention_mask=None, **kwargs):
+    """Wrapped forward for Qwen3 text encoder — outputs stacked hidden states from layers 9/18/27."""
+    import torch
+
+    output = self._orig_forward(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        output_hidden_states=True,
+        use_cache=False,
+        return_dict=True,
+    )
+    layers = self._hidden_states_layers
+    out = torch.stack([output.hidden_states[k] for k in layers], dim=1)
+    batch_size, num_channels, seq_len, hidden_dim = out.shape
+    prompt_embeds = out.permute(0, 2, 1, 3).reshape(batch_size, seq_len, num_channels * hidden_dim)
+    return prompt_embeds

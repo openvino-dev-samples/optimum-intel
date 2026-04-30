@@ -482,6 +482,7 @@ def main_export(
 
         _diffusers_config = _DiffusionPipeline.load_config(model_name_or_path)
         _is_ernie_image = _diffusers_config.get("_class_name") == "ErnieImagePipeline"
+        _is_flux2_klein = _diffusers_config.get("_class_name") == "Flux2KleinPipeline"
         if _is_ernie_image:
             # Force float32 loading for ERNIE-Image to avoid bf16/fp32 conversion mismatches
             loading_kwargs["torch_dtype"] = torch.float32
@@ -505,6 +506,13 @@ def main_export(
                 pe=None,
                 pe_tokenizer=None,
             )
+        elif library_name == "diffusers" and _is_flux2_klein:
+            from diffusers import Flux2KleinPipeline
+
+            _dtype_kwarg = {k: v for k, v in loading_kwargs.items() if k == "torch_dtype"}
+            if "torch_dtype" not in _dtype_kwarg:
+                _dtype_kwarg["torch_dtype"] = torch.bfloat16
+            model = Flux2KleinPipeline.from_pretrained(model_name_or_path, **_dtype_kwarg)
         else:
             # remote code models like phi3_v internvl2, minicpmv, internvl2, nanollava, maira2 should be loaded using AutoModelForCausalLM and not AutoModelForImageTextToText
             # TODO: use config.auto_map to load remote code models instead (for other models we can directly use config.architectures)

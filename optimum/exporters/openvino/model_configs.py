@@ -152,6 +152,8 @@ from .model_patcher import (
     ErnieImageTransformerModelPatcher,
     ErnieImageVAEPatcher,
     FalconModelPatcher,
+    Flux2KleinTextEncoderModelPatcher,
+    Flux2KleinTransformerModelPatcher,
     FluxTransfromerModelPatcher,
     Gemma2ModelPatcher,
     Gemma3LMModelPatcher,
@@ -5721,3 +5723,152 @@ class Qwen3NextOpenVINOConfig(Qwen3OpenVINOConfig):
 class LFM2MoeOpenVINOConfig(LFM2OpenVINOConfig):
     MIN_TRANSFORMERS_VERSION = "5.0"
     _MODEL_PATCHER = Lfm2MoeModelPatcher
+
+
+# ==================== Flux2 Klein ====================
+
+
+class DummyFlux2KleinTransformerInputGenerator(DummyVisionInputGenerator):
+    SUPPORTED_INPUT_NAMES = (
+        "hidden_states",
+        "encoder_hidden_states",
+        "img_ids",
+        "txt_ids",
+    )
+
+    def __init__(
+        self,
+        task: str,
+        normalized_config: NormalizedVisionConfig,
+        batch_size: int = DEFAULT_DUMMY_SHAPES["batch_size"],
+        num_channels: int = DEFAULT_DUMMY_SHAPES["num_channels"],
+        width: int = DEFAULT_DUMMY_SHAPES["width"] // 8,
+        height: int = DEFAULT_DUMMY_SHAPES["height"] // 8,
+        **kwargs,
+    ):
+        super().__init__(task, normalized_config, batch_size, num_channels, width, height, **kwargs)
+        self.in_channels = getattr(normalized_config, "in_channels", 128)
+        self.joint_attention_dim = getattr(normalized_config, "joint_attention_dim", 15360)
+        self.text_seq_len = 16
+        self.img_seq_len = self.height * self.width  # packed latents
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        import torch
+
+        dtype = DTYPE_MAPPER.pt(float_dtype)
+        if input_name == "hidden_states":
+            return torch.randn(self.batch_size, self.img_seq_len, self.in_channels, dtype=dtype)
+        if input_name == "encoder_hidden_states":
+            return torch.randn(self.batch_size, self.text_seq_len, self.joint_attention_dim, dtype=dtype)
+        if input_name == "img_ids":
+            return torch.zeros(self.img_seq_len, 4, dtype=dtype)
+        if input_name == "txt_ids":
+            return torch.zeros(self.text_seq_len, 4, dtype=dtype)
+        return super().generate(input_name, framework, int_dtype, float_dtype)
+
+
+class DummyFlux2KleinTimestepInputGenerator(DummyTimestepInputGenerator):
+    SUPPORTED_INPUT_NAMES = ("timestep",)
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        return self.random_float_tensor([self.batch_size], framework=framework, dtype=float_dtype)
+
+
+@register_in_tasks_manager("flux2-transformer-2d", *["semantic-segmentation"], library_name="diffusers")
+class Flux2KleinTransformerOpenVINOConfig(UNetOpenVINOConfig):
+    NORMALIZED_CONFIG_CLASS = NormalizedConfig.with_args(
+        image_size="sample_size",
+        num_channels="in_channels",
+        hidden_size="hidden_size",
+        vocab_size="num_attention_heads",
+        allow_new=True,
+    )
+    DUMMY_INPUT_GENERATOR_CLASSES = (
+        DummyFlux2KleinTransformerInputGenerator,
+        DummyFlux2KleinTimestepInputGenerator,
+    )
+    _MODEL_PATCHER = Flux2KleinTransformerModelPatcher
+
+    @property
+    def inputs(self):
+        return {
+            "hidden_states": {0: "batch_size", 1: "img_sequence_length"},
+            "encoder_hidden_states": {0: "batch_size", 1: "txt_sequence_length"},
+            "timestep": {0: "batch_size"},
+            "img_ids": {0: "img_sequence_length"},
+            "txt_ids": {0: "txt_sequence_length"},
+        }
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "out_sample": {0: "batch_size", 1: "img_sequence_length"},
+        }
+
+    def generate_dummy_inputs(self, framework: str = "pt", **kwargs):
+        dummy_inputs_generators = self._create_dummy_input_generator_classes(**kwargs)
+        dummy_inputs = {}
+        for input_name in self.inputs:
+            for dummy_input_gen in dummy_inputs_generators:
+                if dummy_input_gen.supports_input(input_name):
+                    dummy_inputs[input_name] = dummy_input_gen.generate(
+                        input_name, framework=framework,
+                    )
+                    break
+        return dummy_inputs
+
+    def rename_ambiguous_inputs(self, inputs):
+        return inputs
+
+
+@register_in_tasks_manager("flux2-klein-text-encoder", *["feature-extraction"], library_name="diffusers")
+class Flux2KleinTextEncoderOpenVINOConfig(CLIPTextOpenVINOConfig):
+    NORMALIZED_CONFIG_CLASS = NormalizedConfig.with_args(
+        vocab_size="vocab_size",
+        num_layers="num_hidden_layers",
+        allow_new=True,
+    )
+    _MODEL_PATCHER = Flux2KleinTextEncoderModelPatcher
+
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "input_ids": {0: "batch_size", 1: "sequence_length"},
+            "attention_mask": {0: "batch_size", 1: "sequence_length"},
+        }
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "prompt_embeds": {0: "batch_size", 1: "sequence_length"},
+        }
+
+
+@register_in_tasks_manager("flux2-klein-vae-encoder", *["semantic-segmentation"], library_name="diffusers")
+class Flux2KleinVaeEncoderOpenVINOConfig(VaeEncoderOnnxConfig):
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "sample": {0: "batch_size", 2: "height", 3: "width"},
+        }
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "latent_parameters": {0: "batch_size", 2: "height_latent", 3: "width_latent"},
+        }
+
+
+@register_in_tasks_manager("flux2-klein-vae-decoder", *["semantic-segmentation"], library_name="diffusers")
+class Flux2KleinVaeDecoderOpenVINOConfig(VaeDecoderOnnxConfig):
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "latent_sample": {0: "batch_size", 2: "height_latent", 3: "width_latent"},
+        }
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "sample": {0: "batch_size", 2: "height", 3: "width"},
+        }

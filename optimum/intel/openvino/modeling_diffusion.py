@@ -125,6 +125,11 @@ try:
 except ImportError:
     ErnieImagePipeline = object
 
+try:
+    from diffusers import Flux2KleinPipeline
+except ImportError:
+    Flux2KleinPipeline = object
+
 
 if is_diffusers_version(">=", "0.35.0"):
     from diffusers.models.cache_utils import CacheMixin
@@ -1731,6 +1736,40 @@ class OVErnieImagePipeline(OVDiffusionPipeline, ErnieImagePipeline):
         return pipeline
 
 
+class OVFlux2KleinPipeline(OVDiffusionPipeline, Flux2KleinPipeline):
+    main_input_name = "prompt"
+    export_feature = "text-to-image"
+    auto_model_class = Flux2KleinPipeline
+
+    @classmethod
+    def _from_pretrained(cls, model_id, config, **kwargs):
+        pipeline = super()._from_pretrained(model_id, config, **kwargs)
+
+        # Load VAE BN running stats for latent normalization
+        model_path = Path(model_id) if os.path.isdir(str(model_id)) else model_id
+        bn_stats_path = Path(model_path) / "vae_bn_stats.npz"
+        if bn_stats_path.exists():
+            import numpy as np
+
+            bn_stats = np.load(bn_stats_path)
+
+            class _MockBN:
+                def __init__(self, running_mean, running_var):
+                    self.running_mean = torch.from_numpy(running_mean.copy())
+                    self.running_var = torch.from_numpy(running_var.copy())
+
+            pipeline.vae.bn = _MockBN(bn_stats["running_mean"], bn_stats["running_var"])
+
+        # Store batch_norm_eps from VAE config
+        if not hasattr(pipeline.vae, "config"):
+            class _MockVAEConfig:
+                batch_norm_eps = 1e-5
+                block_out_channels = [128, 256, 512, 512]
+            pipeline.vae.config = _MockVAEConfig()
+
+        return pipeline
+
+
 SUPPORTED_OV_PIPELINES = [
     OVStableDiffusionPipeline,
     OVStableDiffusionImg2ImgPipeline,
@@ -1819,6 +1858,10 @@ if is_diffusers_version(">=", "0.33.0"):
 if ErnieImagePipeline is not object:
     SUPPORTED_OV_PIPELINES.append(OVErnieImagePipeline)
     OV_TEXT2IMAGE_PIPELINES_MAPPING["ernie-image"] = OVErnieImagePipeline
+
+if Flux2KleinPipeline is not object:
+    SUPPORTED_OV_PIPELINES.append(OVFlux2KleinPipeline)
+    OV_TEXT2IMAGE_PIPELINES_MAPPING["flux2-klein"] = OVFlux2KleinPipeline
 
 SUPPORTED_OV_PIPELINES_MAPPINGS = [
     OV_TEXT2IMAGE_PIPELINES_MAPPING,

@@ -128,6 +128,7 @@ def sdpa_mask_without_vmap(batch_size, q_length=None, kv_length=None, q_offset=0
         kwargs.pop("allow_torch_fix", None)
         kwargs.pop("use_vmap", None)
         kwargs.pop("device", None)
+        kwargs.pop("_slice", None)
         return _orig_sdpa_mask_without_vmap(batch_size, cache_position, kv_length, kv_offset=kv_offset, **kwargs)
     else:
         return _orig_sdpa_mask_without_vmap(
@@ -8716,6 +8717,15 @@ class Qwen3NextModelPatcher(OVDecoderModelPatcher):
                 # Call parent constructor with all required arguments
                 super().__init__(config=config)
 
+                # Ensure attributes are available (DynamicCache in transformers 5.8+ doesn't set them)
+                if not hasattr(self, "layer_types"):
+                    self.layer_types = config.layer_types
+                if not hasattr(self, "transformer_layers"):
+                    self.transformer_layers = [i for i, t in enumerate(self.layer_types) if t == "full_attention"]
+                if not hasattr(self, "last_linear_layer"):
+                    linear_layers = [i for i, t in enumerate(self.layer_types) if t == "linear_attention"]
+                    self.last_linear_layer = linear_layers[-1] if linear_layers else 0
+
                 self.conv_states = conv_states
                 self.recurrent_states = recurrent_states
                 self.key_cache = key_cache
@@ -8759,7 +8769,11 @@ class Qwen3NextModelPatcher(OVDecoderModelPatcher):
                     return 0
                 return self.key_cache[layer_idx].shape[-2]
 
-            @property
+            def get_mask_sizes(self, query_length: int, layer_idx: int = 0) -> tuple:
+                """Return (kv_length, kv_offset) for mask creation."""
+                past_length = self.get_seq_length(layer_idx)
+                return past_length + query_length, 0
+
             def has_previous_state(self):
                 """We have a previous state if the last linear (conv) layer was already updated."""
                 layer_idx = self.linear_attn_mapping[self.last_linear_layer]
@@ -9187,7 +9201,10 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
         model: "PreTrainedModel",
         model_kwargs: Optional[Dict[str, Any]] = None,
     ):
-        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
+        try:
+            from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
+        except ImportError:
+            from transformers import DynamicCache as Qwen3_5DynamicCache
 
         from openvino.frontend.pytorch import ConversionExtension, ModuleExtension
 
@@ -9208,6 +9225,17 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
             def __init__(self, config, conv_states, recurrent_states, key_cache, value_cache):
                 # Call parent constructor with all required arguments
                 super().__init__(config=config)
+
+                # Ensure layer_types is available (DynamicCache in transformers 5.8+ doesn't set it)
+                if not hasattr(self, "layer_types"):
+                    self.layer_types = config.layer_types
+
+                # Ensure transformer_layers and last_linear_layer are available
+                if not hasattr(self, "transformer_layers"):
+                    self.transformer_layers = [i for i, t in enumerate(self.layer_types) if t == "full_attention"]
+                if not hasattr(self, "last_linear_layer"):
+                    linear_layers = [i for i, t in enumerate(self.layer_types) if t == "linear_attention"]
+                    self.last_linear_layer = linear_layers[-1] if linear_layers else 0
 
                 self.conv_states = conv_states
                 self.recurrent_states = recurrent_states
@@ -9252,7 +9280,11 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
                     return 0
                 return self.key_cache[layer_idx].shape[-2]
 
-            @property
+            def get_mask_sizes(self, query_length: int, layer_idx: int = 0) -> tuple:
+                """Return (kv_length, kv_offset) for mask creation."""
+                past_length = self.get_seq_length(layer_idx)
+                return past_length + query_length, 0
+
             def has_previous_state(self):
                 """We have a previous state if the last linear (conv) layer was already updated."""
                 layer_idx = self.linear_attn_mapping[self.last_linear_layer]
@@ -9260,11 +9292,11 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
 
         # the patch is needed to include KV-cache, Conv, and SSM states in the inputs and outputs.
         def patched_forward(
-            input_ids=None,
             attention_mask=None,
             cache_params=None,
             inputs_embeds=None,
             position_ids=None,
+            input_ids=None,
         ):
             text_config = self._text_config
             num_full_attn_layers = text_config.layer_types.count("full_attention")
@@ -9346,6 +9378,31 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
         super().__enter__()
         setattr(self._model, self.orig_forward_name, self.patched_forward)
 
+        # Force eager attention for OpenVINO export compatibility
+        self._orig_attn_implementation = self._text_config._attn_implementation
+        self._text_config._attn_implementation = "eager"
+
+        # Patch padding_mask_function to avoid aten::index with multi-dim tensor indexing,
+        # which causes incorrect stride decomposition in OV frontend when
+        # attention_mask kv_len != hidden_states seq_len (e.g., during decode with KV cache).
+        import transformers.masking_utils as _masking_utils
+        import optimum.exporters.onnx.model_patcher as _onnx_patcher
+
+        self._orig_padding_mask_function = _masking_utils.padding_mask_function
+        self._orig_onnx_padding_mask_function = _onnx_patcher.padding_mask_function
+
+        def _safe_padding_mask_function(padding_mask):
+            # Pre-expand to 4D: [B, K] -> [B, 1, 1, K] to avoid advanced indexing
+            expanded = padding_mask.unsqueeze(1).unsqueeze(1)
+
+            def inner(batch_idx, head_idx, q_idx, kv_idx):
+                return expanded
+
+            return inner
+
+        _masking_utils.padding_mask_function = _safe_padding_mask_function
+        _onnx_patcher.padding_mask_function = _safe_padding_mask_function
+
         for idx, decoder_layer in enumerate(self._text_model.layers):
             layer_type = self._text_config.layer_types[idx]
             if layer_type == "linear_attention":
@@ -9358,11 +9415,19 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
     def __exit__(self, exc_type, exc_value, traceback):
         super().__exit__(exc_type, exc_value, traceback)
         setattr(self._model, self.orig_forward_name, self.model_orig_forward)
+        self._text_config._attn_implementation = self._orig_attn_implementation
         for idx, decoder_layer in enumerate(self._text_model.layers):
             layer_type = self._text_config.layer_types[idx]
             if layer_type == "linear_attention":
                 linear_attn_layer = decoder_layer.linear_attn
                 linear_attn_layer.forward = linear_attn_layer._orig_forward
+
+        # Restore original padding_mask_function
+        import transformers.masking_utils as _masking_utils
+        import optimum.exporters.onnx.model_patcher as _onnx_patcher
+
+        _masking_utils.padding_mask_function = self._orig_padding_mask_function
+        _onnx_patcher.padding_mask_function = self._orig_onnx_padding_mask_function
 
 
 class Qwen3_5VisionEmbMergerPatcher(ModelPatcher):
@@ -9466,3 +9531,217 @@ class Qwen3_5MoeModelPatcher(Qwen3_5ModelPatcher):
             if isinstance(decoder_layer.mlp, Qwen3_5MoeSparseMoeBlock):
                 sparse_moe_block = decoder_layer.mlp
                 sparse_moe_block.forward = sparse_moe_block._orig_forward
+
+
+def _minicpmv4_6_vision_attn_forward(self, hidden_states, cu_seqlens=None, max_seqlen=None, attention_mask=None, **kwargs):
+    """Patched attention forward that uses standard attention_mask instead of cu_seqlens."""
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+
+    query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+    attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    attn_output = torch.matmul(attn_weights, value_states)
+
+    attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
+    attn_output = self.out_proj(attn_output)
+    return attn_output, None
+
+
+def _minicpmv4_6_vision_encoder_layer_forward(self, hidden_states, attention_mask=None, **kwargs):
+    """Patched encoder layer forward that passes attention_mask instead of cu_seqlens."""
+    residual = hidden_states
+    hidden_states = self.layer_norm1(hidden_states)
+    hidden_states, _ = self.self_attn(hidden_states, attention_mask=attention_mask)
+    hidden_states = residual + hidden_states
+
+    residual = hidden_states
+    hidden_states = self.layer_norm2(hidden_states)
+    hidden_states = self.mlp(hidden_states)
+    hidden_states = residual + hidden_states
+    return hidden_states
+
+
+def _minicpmv4_6_vision_embeddings_forward(self, pixel_values, position_ids=None, **kwargs):
+    """Patched embeddings forward that uses pre-computed position_ids."""
+    target_dtype = self.patch_embedding.weight.dtype
+    patch_embeds = self.patch_embedding(pixel_values.to(dtype=target_dtype))
+    embeddings = patch_embeds.flatten(2).transpose(1, 2)
+    position_embeddings = self.position_embedding(position_ids)
+    embeddings = embeddings + position_embeddings
+    return embeddings
+
+
+def _minicpmv4_6_vision_model_forward(
+    self, pixel_values, target_sizes=None, attention_mask=None, position_ids=None,
+    window_index=None, unsort_index=None, window_attn_mask=None, **kwargs
+):
+    """Patched vision model forward for tracing.
+
+    Takes pixel_values and pre-computed position_ids, window indices for a SINGLE image.
+    Uses pre-computed attention_mask instead of cu_seqlens.
+    """
+    hidden_states = self.embeddings(pixel_values, position_ids=position_ids)
+
+    # For single image, attention is full (all patches attend to all)
+    # attention_mask should be (1, 1, seq_len, seq_len) or None
+    use_vit_merger = True
+    insert_layer_id = self.config.insert_layer_id if use_vit_merger else -1
+
+    if use_vit_merger and insert_layer_id >= 0:
+        for layer_index, encoder_layer in enumerate(self.encoder.layers):
+            hidden_states = encoder_layer(hidden_states, attention_mask=attention_mask)
+            if layer_index == insert_layer_id:
+                hidden_states = self.vit_merger(
+                    hidden_states, target_sizes, attention_mask=attention_mask,
+                    window_index=window_index, unsort_index=unsort_index, window_attn_mask=window_attn_mask,
+                )
+                # After vit_merger, target_sizes and seq_len change (downsampled by 2x)
+                target_sizes = target_sizes // 2
+                seq_len = hidden_states.shape[1]
+                # No attention mask needed after merger for single image (full attention)
+                attention_mask = None
+    else:
+        for encoder_layer in self.encoder.layers:
+            hidden_states = encoder_layer(hidden_states, attention_mask=attention_mask)
+
+    last_hidden_state = self.post_layernorm(hidden_states)
+    return last_hidden_state
+
+
+def _minicpmv4_6_vit_merger_forward(self, hidden_states, target_sizes, cu_seqlens=None, attention_mask=None,
+                                    window_index=None, unsort_index=None, window_attn_mask=None):
+    """Patched ViT merger forward for tracing.
+    Accepts pre-computed window_index, unsort_index, window_attn_mask to avoid dynamic ops.
+    """
+    residual = hidden_states
+    hidden_states = self.layer_norm1(hidden_states)
+
+    window_h, window_w = self.window_kernel_size
+    merge_size = window_h * window_w
+
+    # Reorder by window
+    hidden_states_windowed = hidden_states[:, window_index, :]
+
+    hidden_states_windowed, _ = self.self_attn(hidden_states_windowed, attention_mask=window_attn_mask)
+
+    # Unsort
+    hidden_states_unsorted = hidden_states_windowed[:, unsort_index, :]
+    hidden_states = residual + hidden_states_unsorted
+
+    # Spatial merge: reshape using tensor shape to avoid baked-in constants
+    embed_dim = hidden_states.shape[-1]
+    seq_len = hidden_states.shape[1]
+    num_merged = seq_len // merge_size  # merged_h * merged_w
+
+    # Reshape: [1, seq_len, embed_dim] -> [num_merged, merge_size, embed_dim] -> [num_merged, merge_size * embed_dim]
+    patch = hidden_states[0, :seq_len, :]
+    patch = patch.view(num_merged, merge_size, embed_dim)
+    residual_mean = patch.mean(dim=1)
+
+    hidden_state = patch.reshape(num_merged, merge_size * embed_dim)
+    hidden_state = self.pre_norm(hidden_state)
+    hidden_state = self.linear_1(hidden_state)
+    hidden_state = self.act(hidden_state)
+    hidden_state = self.linear_2(hidden_state)
+    new_hidden_states = (hidden_state + residual_mean).unsqueeze(0)
+
+    return new_hidden_states
+
+
+class MiniCPMV4_6VisionModelPatcher(ModelPatcher):
+    """Patches MiniCPM-V-4.6 vision model (vision_tower + merger) for OpenVINO export."""
+
+    def __init__(
+        self,
+        config: "OnnxConfig",
+        model: "PreTrainedModel",
+        model_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        model.__orig_forward = model.forward
+        model.forward = types.MethodType(self._patched_get_image_features, model)
+        super().__init__(config, model, model_kwargs)
+
+    @staticmethod
+    def _patched_get_image_features(self, pixel_values, target_sizes, attention_mask=None, position_ids=None,
+                                    window_index=None, unsort_index=None, window_attn_mask=None):
+        """Forward that combines vision_tower + merger for single image."""
+        pixel_values = pixel_values.to(dtype=self.vision_tower.dtype)
+
+        # Run vision tower (patched to use pre-computed indices)
+        vision_output = self.vision_tower(
+            pixel_values, target_sizes=target_sizes, attention_mask=attention_mask,
+            position_ids=position_ids, window_index=window_index, unsort_index=unsort_index,
+            window_attn_mask=window_attn_mask,
+        )
+
+        # Run MLP merger using tensor shapes (avoid baked-in constants)
+        merge_h, merge_w = self.merger.merge_kernel_size
+        merge_size = merge_h * merge_w
+        seq_len = vision_output.shape[1]
+        embed_dim = vision_output.shape[-1]
+
+        # First merger round
+        num_merged = seq_len // merge_size
+        hidden_state = vision_output[0, :seq_len, :].view(num_merged, merge_size, embed_dim)
+        hidden_state = hidden_state.reshape(num_merged, merge_size * embed_dim)
+        hidden_state = self.merger.mlp[0](hidden_state)
+
+        # Handle additional merger rounds
+        for i in range(1, self.merger.merger_times):
+            inner_dim = hidden_state.shape[-1]
+            cur_len = hidden_state.shape[0]
+            num_merged = cur_len // merge_size
+            hidden_state = hidden_state.view(num_merged, merge_size, inner_dim)
+            hidden_state = hidden_state.reshape(num_merged, merge_size * inner_dim)
+            hidden_state = self.merger.mlp[i](hidden_state)
+
+        return hidden_state
+
+    def __enter__(self):
+        super().__enter__()
+        model = self._model
+
+        # Patch embeddings to use pre-computed position_ids
+        model.vision_tower.embeddings.__orig_forward = model.vision_tower.embeddings.forward
+        model.vision_tower.embeddings.forward = types.MethodType(_minicpmv4_6_vision_embeddings_forward, model.vision_tower.embeddings)
+
+        # Patch vision tower
+        model.vision_tower.__orig_forward = model.vision_tower.forward
+        model.vision_tower.forward = types.MethodType(_minicpmv4_6_vision_model_forward, model.vision_tower)
+
+        # Patch encoder layers
+        for layer in model.vision_tower.encoder.layers:
+            layer.__orig_forward = layer.forward
+            layer.forward = types.MethodType(_minicpmv4_6_vision_encoder_layer_forward, layer)
+            layer.self_attn.__orig_forward = layer.self_attn.forward
+            layer.self_attn.forward = types.MethodType(_minicpmv4_6_vision_attn_forward, layer.self_attn)
+
+        # Patch ViT merger
+        model.vision_tower.vit_merger.__orig_forward = model.vision_tower.vit_merger.forward
+        model.vision_tower.vit_merger.forward = types.MethodType(_minicpmv4_6_vit_merger_forward, model.vision_tower.vit_merger)
+        # Also patch the attention inside vit_merger
+        model.vision_tower.vit_merger.self_attn.__orig_forward = model.vision_tower.vit_merger.self_attn.forward
+        model.vision_tower.vit_merger.self_attn.forward = types.MethodType(_minicpmv4_6_vision_attn_forward, model.vision_tower.vit_merger.self_attn)
+
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+        model = self._model
+
+        model.forward = model.__orig_forward
+        model.vision_tower.embeddings.forward = model.vision_tower.embeddings.__orig_forward
+        model.vision_tower.forward = model.vision_tower.__orig_forward
+
+        for layer in model.vision_tower.encoder.layers:
+            layer.forward = layer.__orig_forward
+            layer.self_attn.forward = layer.self_attn.__orig_forward
+
+        model.vision_tower.vit_merger.forward = model.vision_tower.vit_merger.__orig_forward
+        model.vision_tower.vit_merger.self_attn.forward = model.vision_tower.vit_merger.self_attn.__orig_forward

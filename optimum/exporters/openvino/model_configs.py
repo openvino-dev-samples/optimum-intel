@@ -183,6 +183,7 @@ from .model_patcher import (
     MarianModelPatcher,
     MiniCPM3Patcher,
     MiniCPMModelPatcher,
+    MiniCPMV4_6VisionModelPatcher,
     MiniCPMVImageEmbeddingsModelPatcher,
     MiniCPMVResamplerModelPatcher,
     MistralModelPatcher,
@@ -5999,7 +6000,6 @@ class Qwen3_5TextOpenVINOConfig(Qwen3VLTextOpenVINOConfig):
     DUMMY_PKV_GENERATOR_CLASS = Qwen3_5DummyPastKeyValuesGenerator
     NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
     MIN_TRANSFORMERS_VERSION = "5.2.0"
-    MAX_TRANSFORMERS_VERSION = "5.2.99"
     _MODEL_PATCHER = Qwen3_5ModelPatcher
 
     def add_past_key_values(self, inputs_or_outputs: Dict[str, Dict[int, str]], direction: str):
@@ -6059,6 +6059,19 @@ class Qwen3_5TextOpenVINOConfig(Qwen3VLTextOpenVINOConfig):
                 raise RuntimeError(
                     f'Could not generate dummy input for "{input_name}". Try adding a proper dummy input generator to the model ONNX config.'
                 )
+
+        # Extend attention_mask to cover past + current positions when using past KV cache
+        if self.use_past_in_inputs and "attention_mask" in dummy_inputs and "cache_params" in dummy_inputs:
+            import torch
+
+            attn_mask = dummy_inputs["attention_mask"]
+            # Get past sequence length from KV cache
+            config = self._normalized_config.config
+            n_linear = config.layer_types.count("linear_attention")
+            kv_idx = 2 * n_linear  # first KV cache tensor
+            past_length = dummy_inputs["cache_params"][kv_idx].shape[2]
+            past_mask = torch.ones(attn_mask.shape[0], past_length, dtype=attn_mask.dtype)
+            dummy_inputs["attention_mask"] = torch.cat([past_mask, attn_mask], dim=1)
 
         return dummy_inputs
 
@@ -6221,3 +6234,195 @@ class Qwen3_5MoeOpenVINOConfig(Qwen3_5OpenVINOConfig):
                 "qwen3_5_moe_text", self._orig_config.text_config, self.int_dtype, self.float_dtype
             ).outputs
         return super().outputs
+
+
+class DummyMiniCPMV4_6VisionInputGenerator(DummyVisionInputGenerator):
+    SUPPORTED_INPUT_NAMES = ("pixel_values", "target_sizes", "attention_mask", "position_ids",
+                             "window_index", "unsort_index", "window_attn_mask")
+
+    def __init__(
+        self,
+        task: str,
+        normalized_config: NormalizedVisionConfig,
+        batch_size: int = DEFAULT_DUMMY_SHAPES["batch_size"],
+        num_channels: int = DEFAULT_DUMMY_SHAPES["num_channels"],
+        width: int = DEFAULT_DUMMY_SHAPES["width"],
+        height: int = DEFAULT_DUMMY_SHAPES["height"],
+        **kwargs,
+    ):
+        super().__init__(task, normalized_config, batch_size, num_channels, width, height)
+        self.patch_size = normalized_config.config.patch_size
+        self.image_size = normalized_config.config.image_size
+        self.num_patches_per_side = self.image_size // self.patch_size
+        # Use small grid for dummy inputs; must be divisible by window_kernel_size^2 (4)
+        self.grid_h = 4
+        self.grid_w = 4
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        num_patches = self.grid_h * self.grid_w
+        if input_name == "pixel_values":
+            # NaViT packed format: [batch, channels, patch_size, num_patches * patch_size]
+            return self.random_float_tensor(
+                shape=[1, self.num_channels, self.patch_size, num_patches * self.patch_size],
+                framework=framework,
+                dtype=float_dtype,
+            )
+        if input_name == "target_sizes":
+            return self.constant_tensor(
+                shape=[1, 2],
+                framework=framework,
+                value=self.grid_h,
+                dtype=DTYPE_MAPPER.pt(int_dtype),
+            )
+        if input_name == "attention_mask":
+            return self.constant_tensor(
+                shape=[1, 1, num_patches, num_patches],
+                framework=framework,
+                value=0,
+                dtype=DTYPE_MAPPER.pt(float_dtype),
+            )
+        if input_name == "position_ids":
+            import torch
+
+            boundaries = torch.arange(1 / self.num_patches_per_side, 1.0, 1 / self.num_patches_per_side)
+            fractional_coords_h = torch.arange(0, 1 - 1e-6, 1 / self.grid_h)
+            fractional_coords_w = torch.arange(0, 1 - 1e-6, 1 / self.grid_w)
+            bucket_coords_h = torch.bucketize(fractional_coords_h, boundaries, right=True)
+            bucket_coords_w = torch.bucketize(fractional_coords_w, boundaries, right=True)
+            pos_ids = (bucket_coords_h[:, None] * self.num_patches_per_side + bucket_coords_w).flatten()
+            return pos_ids.unsqueeze(0)
+        if input_name in ("window_index", "unsort_index", "window_attn_mask"):
+            import torch
+
+            window_h, window_w = 2, 2  # window_kernel_size
+            height, width = self.grid_h, self.grid_w
+            index = torch.arange(height * width).reshape(height, width)
+            num_windows_h = height // window_h
+            num_windows_w = width // window_w
+            num_windows = num_windows_h * num_windows_w
+            max_seqlens = window_h * window_w
+            index = index.reshape(num_windows_h, window_h, num_windows_w, window_w)
+            index = index.permute(0, 2, 1, 3).reshape(num_windows, max_seqlens)
+            window_idx = index.reshape(-1)
+
+            if input_name == "window_index":
+                return window_idx
+            if input_name == "unsort_index":
+                return torch.argsort(window_idx)
+            if input_name == "window_attn_mask":
+                seq_len = height * width
+                full_mask = torch.full((1, 1, seq_len, seq_len), float("-inf"))
+                for i in range(num_windows):
+                    start = i * max_seqlens
+                    end = start + max_seqlens
+                    full_mask[:, :, start:end, start:end] = 0
+                return full_mask
+
+
+class MiniCPMV4_6ConfigBehavior(str, enum.Enum):
+    LANGUAGE = "language"
+    VISION_EMBEDDINGS = "vision_embeddings"
+    TEXT_EMBEDDINGS = "text_embeddings"
+
+
+@register_in_tasks_manager("minicpmv4_6", *["image-text-to-text"], library_name="transformers")
+class MiniCPMV4_6OpenVINOConfig(BaseVLMOpenVINOConfig):
+    SUPPORTED_BEHAVIORS = [model_type.value for model_type in MiniCPMV4_6ConfigBehavior]
+    NORMALIZED_CONFIG_CLASS = NormalizedVisionConfig
+    DUMMY_INPUT_GENERATOR_CLASSES = (DummyMiniCPMV4_6VisionInputGenerator,)
+    MIN_TRANSFORMERS_VERSION = "5.7.0"
+
+    def __init__(
+        self,
+        config: "PretrainedConfig",
+        task: str = "feature-extraction",
+        int_dtype: str = "int64",
+        float_dtype: str = "fp32",
+        behavior: MiniCPMV4_6ConfigBehavior = MiniCPMV4_6ConfigBehavior.VISION_EMBEDDINGS,
+        preprocessors: Optional[List[Any]] = None,
+    ):
+        super().__init__(
+            config=config,
+            task=task,
+            int_dtype=int_dtype,
+            float_dtype=float_dtype,
+            preprocessors=preprocessors,
+        )
+        self._behavior = behavior
+        self._orig_config = config
+        if self._behavior == MiniCPMV4_6ConfigBehavior.VISION_EMBEDDINGS and hasattr(config, "vision_config"):
+            self._config = config.vision_config
+            self._normalized_config = self.NORMALIZED_CONFIG_CLASS(self._config)
+
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        if self._behavior == MiniCPMV4_6ConfigBehavior.VISION_EMBEDDINGS:
+            return {
+                "pixel_values": {0: "batch_size", 3: "total_patches_width"},
+                "target_sizes": {0: "num_images"},
+                "attention_mask": {2: "num_patches", 3: "num_patches"},
+                "position_ids": {0: "batch_size", 1: "num_patches"},
+                "window_index": {0: "num_patches"},
+                "unsort_index": {0: "num_patches"},
+                "window_attn_mask": {2: "num_patches", 3: "num_patches"},
+            }
+        return {}
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        if self._behavior == MiniCPMV4_6ConfigBehavior.VISION_EMBEDDINGS:
+            return {"last_hidden_state": {0: "num_visual_tokens"}}
+        return {}
+
+    def with_behavior(
+        self,
+        behavior: Union[str, MiniCPMV4_6ConfigBehavior],
+    ):
+        if isinstance(behavior, str) and not isinstance(behavior, MiniCPMV4_6ConfigBehavior):
+            behavior = MiniCPMV4_6ConfigBehavior(behavior)
+
+        if behavior == MiniCPMV4_6ConfigBehavior.TEXT_EMBEDDINGS:
+            return get_vlm_text_embeddings_config(
+                "qwen3_5_text", self._orig_config.text_config, self.int_dtype, self.float_dtype
+            )
+
+        if behavior == MiniCPMV4_6ConfigBehavior.LANGUAGE:
+            return get_vlm_text_generation_config(
+                "qwen3_5_text",
+                self._orig_config.text_config,
+                self.int_dtype,
+                self.float_dtype,
+                model_patcher=Qwen3_5ModelPatcher,
+            )
+
+        if behavior == MiniCPMV4_6ConfigBehavior.VISION_EMBEDDINGS:
+            return self.__class__(
+                self._orig_config,
+                task=self.task,
+                int_dtype=self.int_dtype,
+                float_dtype=self.float_dtype,
+                behavior=behavior,
+                preprocessors=self._preprocessors,
+            )
+
+    @staticmethod
+    def get_model_for_behavior(model, behavior: Union[str, MiniCPMV4_6ConfigBehavior]):
+        if isinstance(behavior, str) and not isinstance(behavior, MiniCPMV4_6ConfigBehavior):
+            behavior = MiniCPMV4_6ConfigBehavior(behavior)
+
+        if behavior == MiniCPMV4_6ConfigBehavior.LANGUAGE:
+            return model
+
+        if behavior == MiniCPMV4_6ConfigBehavior.VISION_EMBEDDINGS:
+            return model.model
+
+        if behavior == MiniCPMV4_6ConfigBehavior.TEXT_EMBEDDINGS:
+            text_embedding = model.model.language_model.embed_tokens
+            text_embedding.config = model.config.text_config
+            return text_embedding
+
+    def patch_model_for_export(self, model: PreTrainedModel, model_kwargs: Optional[Dict[str, Any]] = None):
+        model_kwargs = model_kwargs or {}
+        if self._behavior == MiniCPMV4_6ConfigBehavior.VISION_EMBEDDINGS:
+            return MiniCPMV4_6VisionModelPatcher(self, model, model_kwargs)
+        return super().patch_model_for_export(model, model_kwargs)

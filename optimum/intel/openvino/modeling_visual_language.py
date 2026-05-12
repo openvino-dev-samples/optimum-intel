@@ -5347,6 +5347,208 @@ class _OVQwen3_5ForCausalLM(OVModelForVisualCausalLM, Qwen3_5Model, Qwen3_5Visio
         return super().generate(*args, **kwargs)
 
 
+class _OVMiniCPMV4_6ForCausalLM(OVModelForVisualCausalLM):
+    """OpenVINO runtime class for MiniCPM-V-4.6."""
+
+    def _compute_position_ids(self, grid_h, grid_w):
+        """Compute position_ids for vision embeddings, matching MiniCPM-V-4.6's bucketed position encoding."""
+        num_patches_per_side = self.config.vision_config.image_size // self.config.vision_config.patch_size
+        boundaries = torch.arange(1 / num_patches_per_side, 1.0, 1 / num_patches_per_side)
+        fractional_coords_h = torch.arange(0, 1 - 1e-6, 1 / grid_h)
+        fractional_coords_w = torch.arange(0, 1 - 1e-6, 1 / grid_w)
+        bucket_coords_h = torch.bucketize(fractional_coords_h, boundaries, right=True)
+        bucket_coords_w = torch.bucketize(fractional_coords_w, boundaries, right=True)
+        pos_ids = (bucket_coords_h[:, None] * num_patches_per_side + bucket_coords_w).flatten()
+        return pos_ids.unsqueeze(0)
+
+    def _compute_window_indices(self, height, width, window_h=2, window_w=2):
+        """Pre-compute window_index, unsort_index, window_attn_mask for vit_merger."""
+        index = torch.arange(height * width).reshape(height, width)
+        num_windows_h = height // window_h
+        num_windows_w = width // window_w
+        num_windows = num_windows_h * num_windows_w
+        max_seqlens = window_h * window_w
+        index = index.reshape(num_windows_h, window_h, num_windows_w, window_w)
+        index = index.permute(0, 2, 1, 3).reshape(num_windows, max_seqlens)
+        window_idx = index.reshape(-1)
+        unsort_idx = torch.argsort(window_idx)
+
+        seq_len = height * width
+        full_mask = torch.full((1, 1, seq_len, seq_len), float("-inf"), dtype=torch.float32)
+        for i in range(num_windows):
+            start = i * max_seqlens
+            end = start + max_seqlens
+            full_mask[:, :, start:end, start:end] = 0
+
+        return window_idx, unsort_idx, full_mask
+
+    def get_vision_embeddings(self, pixel_values, input_ids=None, **kwargs):
+        if input_ids is not None and input_ids.shape[1] == 1:
+            return None
+
+        target_sizes = kwargs.get("target_sizes")
+        if target_sizes is None:
+            return None
+
+        # Process each image individually through the OV vision model
+        all_features = []
+        patch_size = self.config.vision_config.patch_size
+        for i in range(len(target_sizes)):
+            h, w = target_sizes[i]
+            num_patches = int(h) * int(w)
+
+            # Extract this image's pixel values from NaViT packed format
+            # pixel_values: [1, C, patch_size, total_patches * patch_size]
+            # Each patch occupies patch_size pixels in the width dimension
+            start_idx = sum(int(target_sizes[j][0]) * int(target_sizes[j][1]) for j in range(i)) * patch_size
+            pv = pixel_values[:, :, :, start_idx : start_idx + num_patches * patch_size]
+
+            ts = torch.tensor([[h, w]], dtype=torch.int64)
+
+            # Build attention mask (full attention for single image)
+            attn_mask = torch.zeros((1, 1, num_patches, num_patches), dtype=torch.float32)
+
+            # Pre-compute position_ids
+            position_ids = self._compute_position_ids(int(h), int(w))
+
+            # Pre-compute window indices for vit_merger
+            window_index, unsort_index, window_attn_mask = self._compute_window_indices(int(h), int(w))
+
+            result = self.vision_embeddings(
+                pixel_values=pv, target_sizes=ts, attention_mask=attn_mask,
+                position_ids=position_ids, window_index=window_index,
+                unsort_index=unsort_index, window_attn_mask=window_attn_mask,
+            )
+            features = torch.from_numpy(result[0]) if isinstance(result[0], np.ndarray) else result[0]
+            all_features.append(features)
+
+        return all_features
+
+    def merge_vision_text_embeddings(
+        self, vision_embeds, inputs_embeds, input_ids=None, attention_mask=None, position_ids=None, **kwargs
+    ):
+        inputs_embeds = torch.from_numpy(inputs_embeds) if isinstance(inputs_embeds, np.ndarray) else inputs_embeds
+
+        if vision_embeds is not None:
+            image_features = torch.cat(vision_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+
+            image_token_id = self.config.image_token_id
+            if image_token_id is not None:
+                mask = input_ids == image_token_id
+                mask_unsqueezed = mask.unsqueeze(-1)
+                mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
+                inputs_embeds = inputs_embeds.masked_scatter(mask_expanded, image_features)
+
+        return inputs_embeds, attention_mask, position_ids
+
+    def get_multimodal_embeddings(
+        self, input_ids, pixel_values=None, attention_mask=None, position_ids=None, **kwargs
+    ):
+        kwargs.pop("inputs_embeds", None)
+        inputs_embeds = self.get_text_embeddings(input_ids, **kwargs)
+
+        if pixel_values is not None:
+            vision_embeds = self.get_vision_embeddings(pixel_values, input_ids=input_ids, **kwargs)
+            if vision_embeds is not None:
+                inputs_embeds, attention_mask, position_ids = self.merge_vision_text_embeddings(
+                    vision_embeds,
+                    inputs_embeds,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    **kwargs,
+                )
+            else:
+                inputs_embeds = torch.from_numpy(inputs_embeds) if isinstance(inputs_embeds, np.ndarray) else inputs_embeds
+        else:
+            inputs_embeds = torch.from_numpy(inputs_embeds) if isinstance(inputs_embeds, np.ndarray) else inputs_embeds
+
+        # Handle video similarly
+        pixel_values_videos = kwargs.get("pixel_values_videos")
+        target_sizes_videos = kwargs.get("target_sizes_videos")
+        if pixel_values_videos is not None and target_sizes_videos is not None:
+            video_embeds = self.get_vision_embeddings(
+                pixel_values_videos, input_ids=input_ids, target_sizes=target_sizes_videos, **kwargs
+            )
+            if video_embeds is not None:
+                video_features = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+                video_token_id = self.config.video_token_id
+                if video_token_id is not None:
+                    mask = input_ids == video_token_id
+                    mask_unsqueezed = mask.unsqueeze(-1)
+                    mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
+                    inputs_embeds = inputs_embeds.masked_scatter(mask_expanded, video_features)
+
+        return inputs_embeds, attention_mask, position_ids
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        pixel_values=None,
+        target_sizes=None,
+        pixel_values_videos=None,
+        target_sizes_videos=None,
+        downsample_mode=None,
+        **kwargs,
+    ):
+        model_inputs = super().prepare_inputs_for_generation(
+            input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
+            **kwargs,
+        )
+        if past_key_values is None:
+            model_inputs["target_sizes"] = target_sizes
+            model_inputs["pixel_values_videos"] = pixel_values_videos
+            model_inputs["target_sizes_videos"] = target_sizes_videos
+            model_inputs["downsample_mode"] = downsample_mode
+        else:
+            model_inputs["target_sizes"] = None
+            model_inputs["pixel_values_videos"] = None
+            model_inputs["target_sizes_videos"] = None
+            model_inputs["downsample_mode"] = None
+            model_inputs["pixel_values"] = None
+        return model_inputs
+
+    @staticmethod
+    def preprocess_inputs(
+        text: str,
+        image: Optional["Image"] = None,
+        processor: Optional[AutoImageProcessor] = None,
+        tokenizer: Optional[PreTrainedTokenizer] = None,
+        config: Optional[PretrainedConfig] = None,
+        video: Optional["VideoInput"] = None,
+        audio: Optional[np.ndarray] = None,
+    ):
+        if processor is None:
+            raise ValueError("Processor is required.")
+        if audio is not None:
+            raise ValueError("Audio input is not supported")
+
+        conversation = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": text},
+                ],
+            }
+        ]
+        if image is not None:
+            conversation[0]["content"].insert(0, {"type": "image"})
+        if video is not None:
+            conversation[0]["content"].insert(0, {"type": "video"})
+
+        text_prompt = processor.apply_chat_template(conversation, add_generation_prompt=True)
+
+        inputs = processor(images=image, text=text_prompt, videos=video, return_tensors="pt")
+        return inputs
+
+
 MODEL_TYPE_TO_CLS_MAPPING = {
     "llava": _OVLlavaForCausalLM,
     "llava_next": _OVLlavaNextForCausalLM,
@@ -5374,4 +5576,5 @@ MODEL_TYPE_TO_CLS_MAPPING = {
     "qwen3_5_moe": _OVQwen3_5ForCausalLM,
     "qwen3_5_moe_text": _OVQwen3_5ForCausalLM,
     "minicpmo": _OVMiniCPMOForCausalLM,
+    "minicpmv4_6": _OVMiniCPMV4_6ForCausalLM,
 }

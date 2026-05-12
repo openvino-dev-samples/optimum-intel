@@ -9534,7 +9534,7 @@ class Qwen3_5MoeModelPatcher(Qwen3_5ModelPatcher):
 
 
 def _minicpmv4_6_vision_attn_forward(self, hidden_states, cu_seqlens=None, max_seqlen=None, attention_mask=None, **kwargs):
-    """Patched attention forward that uses standard attention_mask instead of cu_seqlens."""
+    """Patched attention forward that uses SDPA with attention_mask instead of cu_seqlens."""
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -9542,11 +9542,9 @@ def _minicpmv4_6_vision_attn_forward(self, hidden_states, cu_seqlens=None, max_s
     key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
-    if attention_mask is not None:
-        attn_weights = attn_weights + attention_mask
-    attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = torch.nn.functional.scaled_dot_product_attention(
+        query_states, key_states, value_states, attn_mask=attention_mask, scale=self.scaling
+    )
 
     attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
     attn_output = self.out_proj(attn_output)

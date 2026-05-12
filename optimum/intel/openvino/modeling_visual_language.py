@@ -5374,7 +5374,9 @@ class _OVMiniCPMV4_6ForCausalLM(OVModelForVisualCausalLM):
         unsort_idx = torch.argsort(window_idx)
 
         seq_len = height * width
-        full_mask = torch.full((1, 1, seq_len, seq_len), float("-inf"), dtype=torch.float32)
+        # Use large negative finite value instead of -inf to avoid NaN in GPU SDPA f16 kernel.
+        # Must be representable in f16 (max finite f16 = 65504), so use -65504.0
+        full_mask = torch.full((1, 1, seq_len, seq_len), -65504.0, dtype=torch.float32)
         for i in range(num_windows):
             start = i * max_seqlens
             end = start + max_seqlens

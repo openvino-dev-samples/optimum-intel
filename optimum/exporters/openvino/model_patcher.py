@@ -9618,12 +9618,12 @@ def _minicpmv4_6_vit_merger_forward(self, hidden_states, target_sizes, cu_seqlen
                                     window_index=None, unsort_index=None, window_attn_mask=None):
     """Patched ViT merger forward for tracing.
     Accepts pre-computed window_index, unsort_index, window_attn_mask to avoid dynamic ops.
+    Uses target_sizes to correctly perform 2D spatial merge (view as merged_h, merge_h, merged_w, merge_w).
     """
     residual = hidden_states
     hidden_states = self.layer_norm1(hidden_states)
 
     window_h, window_w = self.window_kernel_size
-    merge_size = window_h * window_w
 
     # Reorder by window
     hidden_states_windowed = hidden_states[:, window_index, :]
@@ -9634,17 +9634,19 @@ def _minicpmv4_6_vit_merger_forward(self, hidden_states, target_sizes, cu_seqlen
     hidden_states_unsorted = hidden_states_windowed[:, unsort_index, :]
     hidden_states = residual + hidden_states_unsorted
 
-    # Spatial merge: reshape using tensor shape to avoid baked-in constants
+    # Spatial merge using 2D layout from target_sizes
     embed_dim = hidden_states.shape[-1]
-    seq_len = hidden_states.shape[1]
-    num_merged = seq_len // merge_size  # merged_h * merged_w
+    height = target_sizes[0, 0]
+    width = target_sizes[0, 1]
+    merged_h = height // window_h
+    merged_w = width // window_w
 
-    # Reshape: [1, seq_len, embed_dim] -> [num_merged, merge_size, embed_dim] -> [num_merged, merge_size * embed_dim]
-    patch = hidden_states[0, :seq_len, :]
-    patch = patch.view(num_merged, merge_size, embed_dim)
-    residual_mean = patch.mean(dim=1)
+    patch = hidden_states[0, : height * width, :]
+    # Proper 2D spatial merge: group 2x2 patches from the grid
+    patch_5d = patch.view(merged_h, window_h, merged_w, window_w, embed_dim).permute(0, 2, 1, 3, 4)
+    hidden_state = patch_5d.reshape(merged_h * merged_w, window_h * window_w * embed_dim)
+    residual_mean = patch_5d.reshape(merged_h * merged_w, window_h * window_w, embed_dim).mean(dim=1)
 
-    hidden_state = patch.reshape(num_merged, merge_size * embed_dim)
     hidden_state = self.pre_norm(hidden_state)
     hidden_state = self.linear_1(hidden_state)
     hidden_state = self.act(hidden_state)
@@ -9680,25 +9682,34 @@ class MiniCPMV4_6VisionModelPatcher(ModelPatcher):
             window_attn_mask=window_attn_mask,
         )
 
-        # Run MLP merger using tensor shapes (avoid baked-in constants)
+        # After vit_merger, target_sizes is halved
         merge_h, merge_w = self.merger.merge_kernel_size
-        merge_size = merge_h * merge_w
-        seq_len = vision_output.shape[1]
-        embed_dim = vision_output.shape[-1]
+        halved_target_sizes = target_sizes // 2
 
-        # First merger round
-        num_merged = seq_len // merge_size
-        hidden_state = vision_output[0, :seq_len, :].view(num_merged, merge_size, embed_dim)
-        hidden_state = hidden_state.reshape(num_merged, merge_size * embed_dim)
+        # MLP merger: proper 2D spatial merge using halved target_sizes
+        height = halved_target_sizes[0, 0]
+        width = halved_target_sizes[0, 1]
+        embed_dim = vision_output.shape[-1]
+        merged_h = height // merge_h
+        merged_w = width // merge_w
+
+        patch = vision_output[0, : height * width, :]
+        patch_5d = patch.view(merged_h, merge_h, merged_w, merge_w, embed_dim).permute(0, 2, 1, 3, 4)
+        hidden_state = patch_5d.reshape(merged_h * merged_w, merge_h * merge_w * embed_dim)
         hidden_state = self.merger.mlp[0](hidden_state)
 
-        # Handle additional merger rounds
+        # Handle additional merger rounds (merger_times > 1)
         for i in range(1, self.merger.merger_times):
+            height = height // merge_h
+            width = width // merge_w
             inner_dim = hidden_state.shape[-1]
-            cur_len = hidden_state.shape[0]
-            num_merged = cur_len // merge_size
-            hidden_state = hidden_state.view(num_merged, merge_size, inner_dim)
-            hidden_state = hidden_state.reshape(num_merged, merge_size * inner_dim)
+            merged_h = height // merge_h
+            merged_w = width // merge_w
+            hidden_state = (
+                hidden_state.view(merged_h, merge_h, merged_w, merge_w, inner_dim)
+                .permute(0, 2, 1, 3, 4)
+                .reshape(merged_h * merged_w, merge_h * merge_w * inner_dim)
+            )
             hidden_state = self.merger.mlp[i](hidden_state)
 
         return hidden_state

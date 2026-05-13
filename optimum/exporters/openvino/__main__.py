@@ -329,6 +329,14 @@ def main_export(
             dtype = torch.bfloat16
             loading_kwargs["quantization_config"] = Mxfp4Config(dequantize=True)
 
+        # compressed-tensors FP8 models must be dequantized to bf16 before export;
+        # the FP8 quantization hooks are untraceable by torch.jit.trace.
+        if quant_method == "compressed-tensors":
+            from transformers import CompressedTensorsConfig
+
+            dtype = torch.bfloat16
+            loading_kwargs["quantization_config"] = CompressedTensorsConfig(run_compressed=False)
+
         supported_quant_methods = ["gptq", "awq", "bitnet"]
         do_quant_patching = quant_method in supported_quant_methods
         do_gptq_patching = quant_method == "gptq"

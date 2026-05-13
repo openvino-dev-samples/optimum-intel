@@ -4091,7 +4091,7 @@ class Qwen3VLOpenVINOConfig(Qwen2VLOpenVINOConfig):
                     self._orig_config.text_config,
                     self.int_dtype,
                     self.float_dtype,
-                    dummy_input_generator=DummyQwen2VLLMInputGenerator,
+                    dummy_input_generator=DummyQwen3_5LMInputGenerator,
                     inputs_update={"position_ids": {1: "batch_size", 2: "sequence_length"}},
                 )
             else:
@@ -4101,7 +4101,7 @@ class Qwen3VLOpenVINOConfig(Qwen2VLOpenVINOConfig):
                     self.int_dtype,
                     self.float_dtype,
                     model_patcher=Qwen3VLLanguageModelPatcher,
-                    dummy_input_generator=DummyQwen2VLLMInputGenerator,
+                    dummy_input_generator=DummyQwen3_5LMInputGenerator,
                     inputs_update={"position_ids": {1: "batch_size", 2: "sequence_length"}},
                 )
             config._normalized_config.deepstack_visual_indexes = (

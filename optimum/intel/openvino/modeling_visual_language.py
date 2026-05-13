@@ -194,9 +194,9 @@ class OVModelWithEmbedForCausalLM(OVModelForCausalLM):
             if past_len:
                 position_ids = position_ids[..., -inputs_embeds.shape[1] :]
 
-            if self.config.model_type in ["qwen3_5", "qwen3_5_moe"] and position_ids.ndim != 3:
+            if self.config.model_type in ["qwen3_5", "qwen3_5_moe", "qwen3_vl"] and position_ids.ndim != 3:
                 position_ids = np.repeat(np.expand_dims(position_ids, 0), 4, axis=0)
-            elif self.config.model_type in ["qwen2_vl", "qwen3_vl"] and position_ids.ndim != 3:
+            elif self.config.model_type in ["qwen2_vl"] and position_ids.ndim != 3:
                 position_ids = np.repeat(np.expand_dims(position_ids, 0), 3, axis=0)
 
             inputs["position_ids"] = position_ids
@@ -3717,6 +3717,7 @@ class _OVQwen3VLForCausalLM(OVModelForVisualCausalLM, Qwen3VLModel, Qwen3VLVisio
         image_grid_thw=None,
         video_grid_thw=None,
         cache_position=None,
+        mm_token_type_ids=None,
         **kwargs,
     ):
         image_mask = None
@@ -3779,13 +3780,40 @@ class _OVQwen3VLForCausalLM(OVModelForVisualCausalLM, Qwen3VLModel, Qwen3VLVisio
             # It is safe to assume that `length!=1` means we're in pre-fill because compiled
             # models currently cannot do asssisted decoding
             if self.rope_deltas is None:
-                position_ids, rope_deltas = self.get_rope_index(
-                    input_ids,
-                    image_grid_thw,
-                    video_grid_thw,
-                    attention_mask=attention_mask_tensor,
-                )
+                if mm_token_type_ids is None:
+                    mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int)
+                # Handle both transformers <5.8 (no mm_token_type_ids) and >=5.8 signatures
+                import inspect
+
+                _rope_params = inspect.signature(self.get_rope_index).parameters
+                if "mm_token_type_ids" in _rope_params:
+                    position_ids, rope_deltas = self.get_rope_index(
+                        input_ids,
+                        mm_token_type_ids,
+                        image_grid_thw,
+                        video_grid_thw,
+                        attention_mask=attention_mask_tensor,
+                    )
+                else:
+                    position_ids, rope_deltas = self.get_rope_index(
+                        input_ids,
+                        image_grid_thw,
+                        video_grid_thw,
+                        attention_mask=attention_mask_tensor,
+                    )
                 self.rope_deltas = rope_deltas
+                # get_rope_index returns [3, batch, seq] (M-RoPE only).
+                # The exported language model expects [4, batch, seq] where position_ids[0] = text_position_ids.
+                # Prepend sequential text position IDs as the first channel.
+                if position_ids is not None and position_ids.shape[0] == 3:
+                    batch_size = position_ids.shape[1]
+                    seq_length = position_ids.shape[2]
+                    if attention_mask_tensor is not None:
+                        text_pos = attention_mask_tensor.long().cumsum(-1) - 1
+                        text_pos = text_pos.masked_fill(attention_mask_tensor == 0, 0)
+                    else:
+                        text_pos = torch.arange(seq_length, device=position_ids.device).unsqueeze(0).expand(batch_size, -1)
+                    position_ids = torch.cat([text_pos.unsqueeze(0), position_ids], dim=0)
             # then use the prev pre-calculated rope-deltas to get the correct position ids
             else:
                 batch_size, seq_length, _ = inputs_embeds.shape
@@ -3799,7 +3827,7 @@ class _OVQwen3VLForCausalLM(OVModelForVisualCausalLM, Qwen3VLModel, Qwen3VLVisio
                 if cache_position is not None:  # otherwise `deltas` is an int `0`
                     delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
                 position_ids = position_ids.add(delta)
-                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+                position_ids = position_ids.unsqueeze(0).expand(4, -1, -1)
         return inputs_embeds, attention_mask, position_ids, visual_pos_masks, deepstack_visual_embeds
 
     @staticmethod
@@ -5583,18 +5611,33 @@ class _OVQwen3VLForFeatureExtraction(_OVQwen3VLForCausalLM):
         input_ids,
         attention_mask=None,
         position_ids=None,
+        pixel_values=None,
+        image_grid_thw=None,
+        pixel_values_videos=None,
+        video_grid_thw=None,
+        mm_token_type_ids=None,
         **kwargs,
     ):
         self.language_model.compile()
 
-        # Get text embeddings
-        inputs_embeds = self.language_model.embed_tokens(input_ids)
-        np_inputs = isinstance(inputs_embeds, np.ndarray)
+        # Reset rope_deltas for each independent forward call (feature extraction is not autoregressive)
+        self.rope_deltas = None
 
-        # Build position_ids if not provided
-        if position_ids is None:
-            batch_size, seq_length = input_ids.shape
-            position_ids = torch.arange(seq_length, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+        # Use get_multimodal_embeddings to handle vision inputs and compute proper position_ids
+        inputs_embeds, attention_mask, position_ids, visual_pos_masks, deepstack_visual_embeds = (
+            self.get_multimodal_embeddings(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                mm_token_type_ids=mm_token_type_ids,
+            )
+        )
+
+        np_inputs = isinstance(inputs_embeds, np.ndarray)
 
         inputs = self.language_model.prepare_inputs(
             input_ids=input_ids,
@@ -5602,6 +5645,8 @@ class _OVQwen3VLForFeatureExtraction(_OVQwen3VLForCausalLM):
             position_ids=position_ids,
             past_key_values=None,
             inputs_embeds=inputs_embeds,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
         )
         self.language_model.request.start_async(inputs, share_inputs=True)
         self.language_model.request.wait()

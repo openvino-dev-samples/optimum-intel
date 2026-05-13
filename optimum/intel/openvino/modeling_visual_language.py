@@ -3776,13 +3776,17 @@ class _OVQwen3VLForCausalLM(OVModelForVisualCausalLM, Qwen3VLModel, Qwen3VLVisio
                     attention_mask_tensor = (1.0 - attention_mask_tensor).int()
 
             # Calculate RoPE index once per generation in the pre-fill stage only.
-            # When compiling, we can't check tensor values thus we check only input length
-            # It is safe to assume that `length!=1` means we're in pre-fill because compiled
-            # models currently cannot do asssisted decoding
-            if self.rope_deltas is None:
+            # Matches the Qwen2-VL pattern (see L2917): treat cache_position[0]==0 as pre-fill,
+            # and also re-compute when cache_position is None (direct forward() calls such as the
+            # reranker / feature-extraction loops, which would otherwise reuse stale rope_deltas
+            # from the previous sample).
+            is_prefill = cache_position is None or cache_position[0] == 0
+            if is_prefill or self.rope_deltas is None:
                 if mm_token_type_ids is None:
                     mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int)
-                # Handle both transformers <5.8 (no mm_token_type_ids) and >=5.8 signatures
+                # transformers 5.8 added `mm_token_type_ids` to Qwen3VLModel.get_rope_index.
+                # Detect via signature so this works with both <5.8 and >=5.8; drop the
+                # else-branch once optimum-intel bumps its transformers minimum to >=5.8.
                 import inspect
 
                 _rope_params = inspect.signature(self.get_rope_index).parameters

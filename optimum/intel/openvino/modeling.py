@@ -406,24 +406,28 @@ class OVModelForFeatureExtraction(OVModel):
         )
         return BaseModelOutput(last_hidden_state=last_hidden_state)
 
+    @staticmethod
+    def _qwen3_vl_feature_extraction_cls(kwargs):
+        # Visual-language feature extraction for Qwen3-VL is implemented in a dedicated
+        # subclass that wires vision + text + LM submodels. Lazy import avoids a circular
+        # dependency with modeling_visual_language.
+        from .modeling_visual_language import _OVQwen3VLForFeatureExtraction
+
+        kwargs.setdefault("use_cache", False)
+        return _OVQwen3VLForFeatureExtraction
+
     @classmethod
     def _from_pretrained(cls, model_id: Union[str, Path], config: PretrainedConfig, *args, **kwargs):
         if config.model_type == "sam":
             return OVSamModel._from_pretrained(model_id, config, *args, **kwargs)
         if config.model_type == "qwen3_vl":
-            from .modeling_visual_language import _OVQwen3VLForFeatureExtraction
-
-            kwargs.setdefault("use_cache", False)
-            return _OVQwen3VLForFeatureExtraction._from_pretrained(model_id, config, *args, **kwargs)
+            return cls._qwen3_vl_feature_extraction_cls(kwargs)._from_pretrained(model_id, config, *args, **kwargs)
         return super()._from_pretrained(model_id, config, *args, **kwargs)
 
     @classmethod
     def _export(cls, model_id: str, config: PretrainedConfig, *args, **kwargs):
         if config.model_type == "qwen3_vl":
-            from .modeling_visual_language import _OVQwen3VLForFeatureExtraction
-
-            kwargs.setdefault("use_cache", False)
-            return _OVQwen3VLForFeatureExtraction._export(model_id, config, *args, **kwargs)
+            return cls._qwen3_vl_feature_extraction_cls(kwargs)._export(model_id, config, *args, **kwargs)
         return super()._export(model_id, config, *args, **kwargs)
 
     def _preprocess_quantization_config(

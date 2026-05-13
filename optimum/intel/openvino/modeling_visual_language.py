@@ -5426,60 +5426,56 @@ class _OVMiniCPMV4_6ForCausalLM(OVModelForVisualCausalLM):
 
         return all_features
 
+    @staticmethod
+    def _scatter_features_at_token(inputs_embeds, input_ids, features, token_id):
+        mask = (input_ids == token_id).unsqueeze(-1).expand_as(inputs_embeds)
+        return inputs_embeds.masked_scatter(mask, features)
+
     def merge_vision_text_embeddings(
         self, vision_embeds, inputs_embeds, input_ids=None, attention_mask=None, position_ids=None, **kwargs
     ):
         inputs_embeds = torch.from_numpy(inputs_embeds) if isinstance(inputs_embeds, np.ndarray) else inputs_embeds
 
-        if vision_embeds is not None:
+        if vision_embeds is not None and self.config.image_token_id is not None:
             image_features = torch.cat(vision_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-
-            image_token_id = self.config.image_token_id
-            if image_token_id is not None:
-                mask = input_ids == image_token_id
-                mask_unsqueezed = mask.unsqueeze(-1)
-                mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
-                inputs_embeds = inputs_embeds.masked_scatter(mask_expanded, image_features)
+            inputs_embeds = self._scatter_features_at_token(
+                inputs_embeds, input_ids, image_features, self.config.image_token_id
+            )
 
         return inputs_embeds, attention_mask, position_ids
 
     def get_multimodal_embeddings(
         self, input_ids, pixel_values=None, attention_mask=None, position_ids=None, **kwargs
     ):
-        kwargs.pop("inputs_embeds", None)
-        inputs_embeds = self.get_text_embeddings(input_ids, **kwargs)
+        inputs_embeds, attention_mask, position_ids = super().get_multimodal_embeddings(
+            input_ids,
+            pixel_values=pixel_values,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            **kwargs,
+        )
 
-        if pixel_values is not None:
-            vision_embeds = self.get_vision_embeddings(pixel_values, input_ids=input_ids, **kwargs)
-            if vision_embeds is not None:
-                inputs_embeds, attention_mask, position_ids = self.merge_vision_text_embeddings(
-                    vision_embeds,
-                    inputs_embeds,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    **kwargs,
-                )
-            else:
-                inputs_embeds = torch.from_numpy(inputs_embeds) if isinstance(inputs_embeds, np.ndarray) else inputs_embeds
-        else:
-            inputs_embeds = torch.from_numpy(inputs_embeds) if isinstance(inputs_embeds, np.ndarray) else inputs_embeds
-
-        # Handle video similarly
         pixel_values_videos = kwargs.get("pixel_values_videos")
         target_sizes_videos = kwargs.get("target_sizes_videos")
         if pixel_values_videos is not None and target_sizes_videos is not None:
-            video_embeds = self.get_vision_embeddings(
-                pixel_values_videos, input_ids=input_ids, target_sizes=target_sizes_videos, **kwargs
+            # Repack per-frame video tensors into the NaViT layout expected by the vision tower,
+            # mirroring modeling_minicpmv4_6.py: permute(1, 2, 0, 3).reshape(1, C, patch, -1).
+            num_frames = pixel_values_videos.shape[0]
+            pv = pixel_values_videos.permute(1, 2, 0, 3).reshape(
+                1, pixel_values_videos.shape[1], pixel_values_videos.shape[2], -1
             )
-            if video_embeds is not None:
+            ts = target_sizes_videos
+            if ts.shape[0] == 1 and num_frames > 1:
+                ts = ts.repeat(num_frames, 1)
+
+            video_kwargs = {k: v for k, v in kwargs.items() if k not in ("target_sizes", "pixel_values_videos", "target_sizes_videos")}
+            video_embeds = self.get_vision_embeddings(pv, input_ids=input_ids, target_sizes=ts, **video_kwargs)
+            if video_embeds is not None and self.config.video_token_id is not None:
+                inputs_embeds = torch.from_numpy(inputs_embeds) if isinstance(inputs_embeds, np.ndarray) else inputs_embeds
                 video_features = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-                video_token_id = self.config.video_token_id
-                if video_token_id is not None:
-                    mask = input_ids == video_token_id
-                    mask_unsqueezed = mask.unsqueeze(-1)
-                    mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
-                    inputs_embeds = inputs_embeds.masked_scatter(mask_expanded, video_features)
+                inputs_embeds = self._scatter_features_at_token(
+                    inputs_embeds, input_ids, video_features, self.config.video_token_id
+                )
 
         return inputs_embeds, attention_mask, position_ids
 
@@ -5526,29 +5522,37 @@ class _OVMiniCPMV4_6ForCausalLM(OVModelForVisualCausalLM):
         config: Optional[PretrainedConfig] = None,
         video: Optional["VideoInput"] = None,
         audio: Optional[np.ndarray] = None,
+        **processor_kwargs,
     ):
         if processor is None:
             raise ValueError("Processor is required.")
         if audio is not None:
             raise ValueError("Audio input is not supported")
 
-        conversation = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": text},
-                ],
-            }
-        ]
+        content = [{"type": "text", "text": text}]
         if image is not None:
-            conversation[0]["content"].insert(0, {"type": "image"})
+            content.insert(0, {"type": "image", "image": image})
         if video is not None:
-            conversation[0]["content"].insert(0, {"type": "video"})
+            content.insert(0, {"type": "video", "video": video})
+        messages = [{"role": "user", "content": content}]
 
-        text_prompt = processor.apply_chat_template(conversation, add_generation_prompt=True)
+        if video is not None:
+            processor_kwargs.setdefault("max_num_frames", 128)
+            processor_kwargs.setdefault("stack_frames", 1)
+            processor_kwargs.setdefault("max_slice_nums", 1)
+            processor_kwargs.setdefault("use_image_id", False)
+        elif image is not None:
+            processor_kwargs.setdefault("max_slice_nums", 36)
+        processor_kwargs.setdefault("downsample_mode", "16x")
 
-        inputs = processor(images=image, text=text_prompt, videos=video, return_tensors="pt")
-        return inputs
+        return processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+            **processor_kwargs,
+        )
 
 
 MODEL_TYPE_TO_CLS_MAPPING = {

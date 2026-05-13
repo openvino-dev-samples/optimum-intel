@@ -6311,7 +6311,8 @@ class DummyMiniCPMV4_6VisionInputGenerator(DummyVisionInputGenerator):
                 return torch.argsort(window_idx)
             if input_name == "window_attn_mask":
                 seq_len = height * width
-                full_mask = torch.full((1, 1, seq_len, seq_len), float("-inf"))
+                # Match runtime _compute_window_indices: use max finite f16 magnitude to stay safe under GPU f16 SDPA.
+                full_mask = torch.full((1, 1, seq_len, seq_len), -65504.0, dtype=torch.float32)
                 for i in range(num_windows):
                     start = i * max_seqlens
                     end = start + max_seqlens

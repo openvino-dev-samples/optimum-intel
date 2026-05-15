@@ -108,6 +108,25 @@ def postprocess_past_key_values(past_key_values):
     return past_key_values
 
 
+# transformers >= 5 removed DynamicCache.to_legacy_cache, but optimum-onnx's wrapper
+# in optimum/exporters/onnx/model_patcher.py still calls it directly. Monkey-patch the
+# upstream helper to fall back to layer iteration so decoder export works for
+# transformers-5 models (Qwen3-Next, HYV3, etc.).
+if is_transformers_version(">=", "5"):
+    import optimum.exporters.onnx.model_patcher as _onnx_model_patcher
+
+    _orig_onnx_postprocess = _onnx_model_patcher.postprocess_past_key_values
+
+    def _onnx_postprocess_past_key_values_compat(past_key_values, output_names):
+        if isinstance(past_key_values, (EncoderDecoderCache, DynamicCache)) and not hasattr(
+            past_key_values, "to_legacy_cache"
+        ):
+            past_key_values = postprocess_past_key_values(past_key_values)
+        return _orig_onnx_postprocess(past_key_values, output_names)
+
+    _onnx_model_patcher.postprocess_past_key_values = _onnx_postprocess_past_key_values_compat
+
+
 def _get_model_attribute(model, name):
     target = getattr(model, "model", model) if is_transformers_version(">=", "5") else model
     return getattr(target, name)
@@ -9504,6 +9523,106 @@ class Qwen3_5MoeModelPatcher(Qwen3_5ModelPatcher):
             if isinstance(decoder_layer.mlp, Qwen3_5MoeSparseMoeBlock):
                 sparse_moe_block = decoder_layer.mlp
                 sparse_moe_block.forward = sparse_moe_block._orig_forward
+
+
+def hyv3_moe_forward_patched(self, hidden_states):
+    r"""
+    HYV3 (Hy-MT2-30B-A3B) MoE forward producing IR matchable by the OpenVINO GPU
+    plugin's MoE fusion pipeline:
+
+      VectorizedMOE3GEMMTransposeWeights -> FuseVectorizedMOE3GEMM
+      -> ConvertMOEToMOECompressed -> FuseMOE3GemmCompressed (Sigmoid+bias 14-input branch)
+      -> KeepMOE3GemmConstPrecision
+
+    Routing pattern (Sigmoid+bias):
+        MatMul(gate) -> Sigmoid -> Add(bias) -> TopK
+                              \-> GatherElements(unbiased) -> ReduceSum -> Add(eps) -> Divide
+                                                                       -> ScatterElementsUpdate
+
+    Every node on the normalize chain has consumers_count(1) as required by
+    FuseMOE3GemmCompressed.  router_scaling_factor is pulled OUT of the gate
+    (applied as a post-fusion constant multiply on the ReduceSum output) so
+    the fused kernel works with normalized routing weights internally.
+    """
+    num_experts = self._hyv3_num_experts
+    top_k = self._hyv3_top_k
+    scaling_factor = self._hyv3_scaling_factor
+    batch_size, seq_len, hidden_dim = hidden_states.shape
+
+    # 3D->2D reshape feeds BOTH the routing MatMul and the tiled expert MatMul.
+    hidden_states_flat = hidden_states.view(-1, hidden_dim)
+
+    # ---- Routing (sigmoid + bias, normalized; scaling pulled out) ----
+    logits = torch.nn.functional.linear(hidden_states_flat, self.gate.weight.float())
+    scores = torch.sigmoid(logits)  # 2 consumers: Add(bias), GatherElements
+    biased_scores = scores + self.e_score_correction_bias.float()  # consumers_count(1) -> TopK
+    _, topk_indices = torch.topk(biased_scores, k=top_k, dim=-1, sorted=False)
+    topk_weights = torch.gather(scores, 1, topk_indices)  # gather UNBIASED scores
+    topk_sum = topk_weights.sum(dim=-1, keepdim=True)  # consumers_count(1)
+    topk_sum_eps = topk_sum + 1e-20  # consumers_count(1)
+    topk_norm = topk_weights / topk_sum_eps  # consumers_count(1) Divide
+
+    new_routing_weights = torch.zeros(batch_size * seq_len, num_experts, dtype=topk_norm.dtype)
+    new_routing_weights.scatter_(dim=1, index=topk_indices, src=topk_norm)
+
+    # ---- Shared expert (parallel, outside fused pattern) ----
+    shared_output = self.shared_experts(hidden_states_flat)
+
+    # ---- Vectorized 3-GEMM expert path ----
+    # gate_projs / up_projs / down_projs are PRE-stacked in __enter__ as [E, N, K]
+    # Constants. .transpose(-1,-2) traces as a Transpose node; TransposeMatMul
+    # absorbs it into MatMul(tb=true), keeping the Constant in [E, N, K] which
+    # ConvertMOEToMOECompressed expects for INT4 group-compressed weights.
+    hidden_states_rep = hidden_states_flat.repeat(num_experts, 1).view(num_experts, -1, hidden_dim)
+    gate = torch.bmm(hidden_states_rep, self.gate_projs.transpose(-1, -2))
+    up = torch.bmm(hidden_states_rep, self.up_projs.transpose(-1, -2))
+    gate_up = torch.nn.functional.silu(gate) * up  # SwiGLU
+    next_states = torch.bmm(gate_up, self.down_projs.transpose(-1, -2))
+
+    next_states = next_states.view(num_experts, batch_size, -1, hidden_dim)
+    next_states = next_states * new_routing_weights.transpose(0, 1).view(num_experts, batch_size, -1, 1)
+    next_states = next_states.sum(dim=0)  # ReduceSum: pattern root
+
+    # Original gate multiplied normalized weights by router_scaling_factor; we pulled
+    # that out so the fused kernel uses pure normalized weights, then re-apply it
+    # as a constant multiply on the reduced output.
+    next_states = next_states * scaling_factor
+    output = shared_output.view(batch_size, -1, hidden_dim) + next_states
+    return output.view(batch_size, seq_len, hidden_dim)
+
+
+class HYV3ModelPatcher(OVDecoderModelPatcher):
+    def __enter__(self):
+        from transformers.models.hy_v3.modeling_hy_v3 import HYV3MoE
+
+        super().__enter__()
+        cfg = self._model.config
+        for layer in self._model.model.layers:
+            if isinstance(layer.mlp, HYV3MoE):  # auto-skips dense layers (first_k_dense_replace)
+                moe = layer.mlp
+                moe._orig_forward = moe.forward
+                moe._hyv3_num_experts = cfg.num_experts
+                moe._hyv3_top_k = cfg.num_experts_per_tok
+                moe._hyv3_scaling_factor = cfg.router_scaling_factor
+                moe.forward = types.MethodType(hyv3_moe_forward_patched, moe)
+
+                # gate_up_proj is fused [E, 2*I, H]; chunk along dim=1 -> two [E, I, H].
+                # Keep [E, N, K] layout (= [E, I, H]) -- DO NOT pre-transpose.
+                gate_w, up_w = moe.experts.gate_up_proj.chunk(2, dim=1)
+                moe.gate_projs = gate_w.contiguous().float()  # [E, I, H]
+                moe.up_projs = up_w.contiguous().float()  # [E, I, H]
+                moe.down_projs = moe.experts.down_proj.contiguous().float()  # [E, H, I]
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        from transformers.models.hy_v3.modeling_hy_v3 import HYV3MoE
+
+        super().__exit__(exc_type, exc_value, traceback)
+        for layer in self._model.model.layers:
+            if isinstance(layer.mlp, HYV3MoE):
+                layer.mlp.forward = layer.mlp._orig_forward
+                del layer.mlp._orig_forward
+                del layer.mlp._hyv3_num_experts, layer.mlp._hyv3_top_k, layer.mlp._hyv3_scaling_factor
+                del layer.mlp.gate_projs, layer.mlp.up_projs, layer.mlp.down_projs
 
 
 class Qwen3ASRModelPatcher(OVSeq2SeqModelPatcher):

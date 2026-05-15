@@ -170,6 +170,7 @@ from .model_patcher import (
     GptOssModelPatcher,
     GraniteMoeHybridModelPatcher,
     GraniteMoEModelPatcher,
+    HYV3ModelPatcher,
     IBertModelPatcher,
     Idefics3ImageEmbeddingsModelPatcher,
     InputEmbeddingPatcher,
@@ -6142,6 +6143,18 @@ class HunyuanV1DenseOpenVINOConfig(LlamaOpenVINOConfig):
     MIN_TRANSFORMERS_VERSION = "4.57.0"
     DUMMY_INPUT_GENERATOR_CLASSES = (DummyTextInputGenerator, GemmaDummyPastKeyValuesGenerator)
     DUMMY_PKV_GENERATOR_CLASS = GemmaDummyPastKeyValuesGenerator
+
+
+@register_in_tasks_manager(
+    "hy_v3",
+    *["text-generation", "text-generation-with-past"],
+    library_name="transformers",
+)
+class HYV3OpenVINOConfig(LlamaOpenVINOConfig):
+    MIN_TRANSFORMERS_VERSION = "5.6.0"
+    DUMMY_INPUT_GENERATOR_CLASSES = (DummyTextInputGenerator, GemmaDummyPastKeyValuesGenerator)
+    DUMMY_PKV_GENERATOR_CLASS = GemmaDummyPastKeyValuesGenerator
+    _MODEL_PATCHER = HYV3ModelPatcher
 
 
 class Qwen3NextDummyPastKeyValuesGenerator(DummyPastKeyValuesGenerator):

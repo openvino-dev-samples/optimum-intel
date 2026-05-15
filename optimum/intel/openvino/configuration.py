@@ -641,11 +641,12 @@ _DEFAULT_IGNORED_SCOPE_CONFIGS = {
     # HYV3 (Tencent/Hy-MT2-30B-A3B) — sigmoid+bias routing requires gate.weight in
     # FP precision so GPU MoE3GemmFusedCompressed routing matches CPU; INT4 gate
     # quantization combined with FP16 GEMV cuts cosine vs PT(fp32) from 0.99 to 0.87.
-    # Pattern matches the top-level mlp/aten::linear/MatMul (shared_experts use
-    # mlp.shared_experts.{gp,up,dp}/aten::linear/MatMul friendly names — different prefix).
+    # Pattern matches the top-level routing gate (HYV3 F.linear traces as `aten::linear`),
+    # while shared_experts and other submodule Linears trace as `ov_ext::linear` and
+    # remain INT4-quantized.
     "tencent/Hy-MT2-30B-A3B": {
         "model": {
-            "patterns": [r"__module\.model\.layers\.\d+\.mlp/aten::linear/MatMul$"],
+            "patterns": [".*mlp/aten::linear.*"],
         },
     },
 }

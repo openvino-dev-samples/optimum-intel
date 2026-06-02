@@ -9940,21 +9940,29 @@ class KokoroModelPatcher(ModelPatcher):
 
 
 def minicpm5_moe_forward_patched(self, hidden_states):
-    """Vectorized MoE forward producing a graph that matches the OV GPU MoE fusion chain:
+    """Vectorized (batched-bmm) MoE forward producing a graph that matches the OV GPU
+    generic MoE fusion pipeline:
 
-    1. VectorizedMOE3GEMMTransposeWeights (MOC) — converts MatMul(tb=false→true)
-    2. FuseVectorizedMOE3GEMM (GPU plugin) — fuses expert computation into MOE op
-    3. ConvertMOEToMOECompressed (GPU plugin) — handles compressed weights
-    4. FuseMOE3GemmCompressed (GPU plugin) — fuses router + MOECompressed
+    1. TransposeMatMul (GPU plugin) — absorbs the .transpose(-1,-2) on each expert
+       weight into MatMul(transpose_b=true), leaving Constant[E, N, K].
+    2. ConvertTiledMoeBlockToGatherMatmuls (common) — matches the tiled batched-bmm
+       block (Tile → Reshape → 3× MatMul(tb=true) + SwiGLU → Reshape → Multiply →
+       ReduceSum) and rewrites it to the GatherMatmul (BGM) representation.
+    3. ConvertGatherMatmulToGatherMatmulCompressed (common) — folds the INT4 group
+       decompression Converts into compressed GatherMatmuls (expects [E, N, K] weights,
+       group-quantized to [E, N, K/G, G]).
+    4. MoeOpFusion (common) — GatherMatmul graph → MOE / MOECompressed op.
+    5. FuseMOESharedExpert + FuseMOE3GemmCompressed (GPU plugin) — fuse the router
+       subgraph + MOECompressed into a single MOE3GemmFusedCompressed GPU op.
 
-    Expert computation pattern (matched by FuseVectorizedMOE3GEMM):
-      Reshape(2D) → Tile → Reshape(3D) → 3× MatMul(tb=true) + Swish·Mul (SwiGLU)
-      → Reshape(4D) → Multiply(routing) → ReduceSum
+    Expert computation pattern (matched by ConvertTiledMoeBlockTo3GatherMatmuls):
+      Reshape(2D) → Tile → Reshape(3D, exactly 2 consumers) → 3× MatMul(tb=true)
+      + Swish·Mul (SwiGLU) → Reshape(4D) → Multiply(routing) → ReduceSum(keep_dims=false)
 
     Routing pattern (matched by FuseMOE3GemmCompressed's Sigmoid+bias branch):
       MatMul(gate_linear) → Sigmoid → Add(bias) → TopK
       → GatherElements(Sigmoid) → ReduceSum → Add(eps) → Divide
-      → Slice → ScatterElementsUpdate → Transpose → Reshape → Unsqueeze
+      → [Slice] → ScatterElementsUpdate → Transpose → Reshape → [Unsqueeze]
 
     The original MiniCPM5 model uses **sigmoid** routing with e_score_correction_bias
     for expert selection, then gathers original (unbiased) scores as weights, normalizes
@@ -9963,6 +9971,13 @@ def minicpm5_moe_forward_patched(self, hidden_states):
     The GPU fusion kernel handles sigmoid+bias routing internally.  After fusion the
     kernel produces sum_i(expert_i * w_norm_i).  We apply a post-fusion correction
     multiply by scaling_factor to match the original semantics.
+
+    Note: this is the same batched-bmm idiom as the generic
+    ``batched_mm_experts_forward_patched`` above; the expert weights are kept in their
+    original [E, N, K] (out_features, in_features) layout (NOT pre-transposed) and the
+    forward applies .transpose(-1,-2) so TransposeMatMul produces MatMul(tb=true) over
+    Constant[E, N, K] — the layout ConvertGatherMatmulToGatherMatmulCompressed expects
+    for group-compressed INT4 weights.
     """
     num_experts = self.config.n_routed_experts
     top_k = self.config.num_experts_per_tok
@@ -10023,15 +10038,16 @@ def minicpm5_moe_forward_patched(self, hidden_states):
     hidden_states_rep = hidden_states_flat.repeat(num_experts, 1).view(num_experts, -1, hidden_dim)
 
     # Weights are [E, N, K]; .transpose(-1,-2) produces [E, K, N] as a Transpose node
-    # in the IR. TransposeMatMul (MOC) absorbs it → MatMul(tb=true) with Constant[E,N,K].
+    # in the IR. TransposeMatMul (GPU plugin, runs before ConvertTiledMoeBlockToGatherMatmuls)
+    # absorbs it → MatMul(transpose_b=true) with Constant[E, N, K].
     gate = torch.bmm(hidden_states_rep, self.gate_projs.transpose(-1, -2))
     up = torch.bmm(hidden_states_rep, self.up_projs.transpose(-1, -2))
     # SiLU traces to aten::silu → ov::Swish; together with Multiply this is SwiGLU.
     gate_up = torch.nn.functional.silu(gate) * up
     next_states = torch.bmm(gate_up, self.down_projs.transpose(-1, -2))
 
-    # Reshape(4D) → Multiply(routing) → ReduceSum — pattern tail
-    # FuseVectorizedMOE3GEMM matches up to ReduceSum (pattern root).
+    # Reshape(4D) → Multiply(routing) → ReduceSum — pattern tail.
+    # ConvertTiledMoeBlockTo3GatherMatmuls matches up to ReduceSum (keep_dims=false).
     next_states = next_states.view(num_experts, batch_size, -1, hidden_dim)
     next_states = next_states * new_routing_weights.transpose(0, 1).view(num_experts, batch_size, -1)[..., None]
     next_states = next_states.sum(dim=0)
@@ -10060,9 +10076,10 @@ class MiniCPM5MoEModelPatcher(OVDecoderModelPatcher):
                 # Prepare batched weight matrices for vectorized MoE computation.
                 # Keep weights in original [E, out_features, in_features] = [E, N, K] layout
                 # (do NOT pre-transpose). The forward pass uses .transpose(-1,-2) which
-                # traces as a Transpose node in the IR. TransposeMatMul (MOC) absorbs it
-                # into MatMul(tb=true), leaving Constant[E,N,K] — the layout that
-                # ConvertMOEToMOECompressed expects for group-compressed INT4 weights.
+                # traces as a Transpose node in the IR. TransposeMatMul (GPU plugin) absorbs
+                # it into MatMul(transpose_b=true), leaving Constant[E, N, K] — the layout
+                # ConvertGatherMatmulToGatherMatmulCompressed expects for group-compressed
+                # INT4 weights ([E, N, K/G, G]).
                 moe.down_projs = (
                     torch.concat(
                         tuple(moe.experts[i].down_proj.weight.unsqueeze(0) for i in range(num_experts)),

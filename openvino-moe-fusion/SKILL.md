@@ -204,7 +204,7 @@ Read `references/debugging.md` for detailed troubleshooting.
 | CPU INT4 ≠ Torch BF16 top-1 | INT4 quantization loss | Expected — use larger group_size or sensitivity metrics for better INT4 |
 | CPU FP16 model ≠ Torch BF16 top-1 | BF16→FP16 precision conversion | Expected for models with tight logit margins |
 | Exec graph shows 0/27 fused ops, or N standalone "MOECompressed" | **Wrong detection method** — friendly-name substring matches leftover Reshape nodes (`.../ReduceSum_1_Reshape/MOECompressed`). | Classify by exec-graph op TYPE: `op.get_rt_info()["layerType"].astype(str) == "moe_3gemm_fused_compressed"`, not by friendly name. |
-| GPU degenerate (repeats one token); only ~2 of top-k experts compute correct output, rest garbage (per-expert dir-cos ~0.03) | **Scale/zp layout mismatch on INT4 expert GEMM.** See "Known Bug: INT4 Expert Scale Layout" below. | Export scale is N-major `[E,N,K/G]`; GPU kernels read group-major `[E,K/G,N]`. |
+| GPU degenerate (repeats one token); routing logits wrong (e.g. ~`[-0.35,…]` instead of `[-2.75,…]`) | **Router gate FC horizontally-fused with shared-expert FCs** → MoE op reads wrong VariadicSplit slice as routing logits. See "Fixed Bug: router gate horizontally-fused…" below. | Exclude FCs feeding `MOE3GemmFusedCompressed` from `FullyConnectedHorizontalFusion`. |
 | All NaN output after adding new fused input | **KeepMOE3GemmConstPrecision** pattern mismatch | Pattern has hardcoded input count; if it doesn't match, u4 constants lose precision marking → NaN |
 
 ## Known Fix: FP16 Gate MatMul Routing Precision
@@ -227,40 +227,45 @@ Read `references/debugging.md` for detailed troubleshooting.
 
 **Key lesson:** `keep_moe_3gemm_const_precision.cpp` must match the exact input count in its `wrap_type` pattern. If it doesn't match, u4 weight Constants silently lose their `keep_const_precision` attribute → type conversion → NaN.
 
-## Known Bug (OPEN): INT4 Expert Scale Layout — N-major export vs group-major kernel
+## Fixed Bug: router gate horizontally-fused with shared-expert FCs (GPU degenerate output)
 
-**Symptom (MiniCPM5-MoE INT4 on GPU Flex 170, 2026-06-03):** OV INT4 on **CPU matches PyTorch
-20/20 tokens**, but the **same IR on GPU is degenerate** (repeats one token; prefill last-token
-logits cos vs CPU ≈ −0.28). Fusion itself is fine (27 `moe_3gemm_fused_compressed` ops).
+**Symptom (MiniCPM5-MoE INT4 on GPU Flex 170, 2026-06-03):** OV INT4 matched PyTorch 20/20 on **CPU**,
+but the **same IR on GPU was degenerate** (repeated one token, e.g. `" in in in …"`). Fusion itself was
+fine (27 `moe_3gemm_fused_compressed` ops).
 
 > **⚠️ FIRST: clear caches between every GPU debug run.** optimum-intel enables OV model caching by
 > default (`<model_dir>/model_cache/*.blob`) plus the driver's `~/.cache/neo_compiler_cache`. A cached
 > compiled model **skips the whole transformation pipeline**, so kernel/pass edits *and* tensor dumps
-> silently reflect the **old** build — this produced misleading intermediate results during the first
-> investigation of this bug. Always:
+> silently reflect the **old** build — this caused several misleading intermediate diagnoses. Always:
 > `rm -rf <model_dir>/model_cache ~/.cache/neo_compiler_cache` and pass `ov_config={"CACHE_DIR":""}`.
 > Trust only cache-free numbers.
 
-**Localization (cache-free; dump GPU op I/O with `OV_GPU_DUMP_TENSORS_PATH`, compare to CPU `OV_CPU_BLOB_DUMP_DIR`):**
-- MoE op input hidden states match CPU (cos 0.999); expert *selection* matches CPU; forcing uniform
-  routing weights still recombines to cos 0.97 ⇒ **routing is not the cause**.
-- The **per-expert INT4 expert GEMM is wrong** (cache-free, tiny 3-layer repro): end-to-end last-token
-  logits cos GPU-vs-CPU ≈ 0.73; expert SwiGLU/down outputs have wrong magnitudes vs the CPU
-  GatherMatmul reference. Reproduces across GPU paths (`exec_batched_gemv` for ≤32 tokens; grouped /
-  micro_gemm / oneDNN-loop prefill for >32). The full-28-layer model is fully degenerate.
+**Root cause:** `FullyConnectedHorizontalFusion` (GPU plugin, `fc_horizontal_fusion.cpp`) runs **after**
+`FuseMOE3GemmCompressed` and fuses all `FullyConnectedCompressed` users of a shared input. The **MoE
+router gate** FC and the **shared-expert gate/up** FCs all consume the same hidden state, so they were
+merged into one MatMul + `VariadicSplit`. The fused MoE op kept its routing-logits input wired to the
+merged op and ended up reading the **wrong split slice** — the shared-expert gate_proj output
+(~`[-0.35,…]`) instead of the true router logits (~`[-2.75,…]`). Wrong logits → `sigmoid_bias_topk`
+selects the wrong experts → degenerate output.
 
-**Leading hypothesis (NOT yet confirmed as the whole cause): scale/zp layout.**
-- Weight reaches the kernels N-major `[E,N,K]` and is read correctly (`B = weight + n*K/2`).
-- Kernels index scale **group-major `[E,K/G,N]`** (`moe_3gemm_swiglu_mlp.cl` gate_up_gemv:
-  `S = scales + n; scale_offset = (gk*FAKE_GROUP_SIZE/GATE_UP_GROUP_SIZE)*N`; grouped/oneDNN:
-  `convert2dnnl(scale, {ic/group, oc}, format_tag::ab)`; the passing unit test
-  `moe_3gemm_gpu_test.cpp` builds scales `scales[e*num_groups + g*cols + c]` = `[E,K/G,N]`).
-  The export delivers scale N-major `[E,N,K/G]` (rank-3 at the fusion input, e.g. `[160,512,16]`).
-- **BUT** a trial transpose of scale/zp to `[E,K/G,N]` inside `FuseMOE3GemmCompressed` did **not** fix
-  the cache-free output (cos unchanged ~0.73) — so scale layout alone is not the full story. Re-localize
-  cache-free before landing any fix, and validate against qwen3/gemma4 (shared kernels).
+**How it was localized (cache-free):** in-kernel `printf` of `expert_id` (per slot) and the routing
+`in_value`/`sigmoid` in `sigmoid_bias_topk` showed GPU logits ≈ `[-0.35,…]` vs the true `[-2.75,…]`
+(recomputed as `hidden @ gate_W.T`). Searching the GPU tensor dumps for `[-0.35,…]` found them in
+`…shared_experts.gate_proj…_fused_3FCs` — pinpointing the horizontal-fusion mis-wire. (An isolated
+compressed transpose_b MatMul was verified correct on GPU, ruling out the INT4 FC kernel itself.)
 
-**Status:** **req #3 passes on `--device CPU` only**; GPU INT4 MoE output is wrong — open bug, not yet fixed.
+**Fix (`fc_horizontal_fusion.cpp`):** add `feeds_moe_router(fc)` (true if any consumer is a
+`MOE3GemmFusedCompressed`) and skip such FCs in both the `is_target_pattern` predicate and the
+collection loop, so the router gate stays out of the horizontal fusion. Result: tiny 3-layer repro
+GPU-vs-CPU cosine **0.9995**, argmax identical; full model generates correct text; MoE still fused (27).
+
+**Precision hardening (same change set):** the decode `mlp_reduce` (`moe_3gemm_swiglu_mlp.cl`) and the
+prefill `moe_scatter_reduction_opt.cl` summed per-expert outputs in **fp16**; switched both to **fp32**
+accumulation (cast back to fp16 on store) to match the CPU reference and reduce borderline greedy flips.
+
+**Residual:** free-running greedy GPU vs CPU still flips occasionally, but **only at near-tie steps**
+(CPU top-2 logit margin < 0.2); per-step teacher-forced logit cosine is ~0.99+. This is inherent
+FP16-vs-bf16 sensitivity, not a bug. For tightest top-1 agreement use int8 / lower-aggression int4.
 
 ## Supported MoE Architectures
 
